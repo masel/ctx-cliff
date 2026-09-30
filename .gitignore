@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Measurement results, server logs and slot snapshots
+outputs/
+logs/
+slot-snapshots/
+unittests/logs/
+
+# Local run scripts and old versions
+*.bat
+*.cmd
+*.ps1
+ctx-cliff_old.py
