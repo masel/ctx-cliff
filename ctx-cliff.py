@@ -2131,6 +2131,212 @@ def agent_prompt_parts(base: str, run_marker: str, task: str, thinking: str,
     return parts[0], parts[1]
 
 
+# --- --api openai-chat: OpenAI-compatible chat servers such as Strata ----------
+
+CHAT_AGENT_ACK = "I'll start by reading the relevant files."
+# Default --agent-step-task: every tool result asks about the code it just
+# returned, so each reply is new text. With the same task at every point the
+# model rewrites its previous answer, which suffix drafting (Strata) then
+# predicts almost perfectly: decode t/s and tokens per step rise with the
+# number of earlier answers instead of reflecting the context length. A fixed
+# step wording is not enough either: a greedy reply starts by quoting it and
+# then repeats the previous reply word for word. {where} names the lines and
+# definitions of this tool result, so every reply starts differently.
+AGENT_STEP_TASK = ("For this step only: explain what the code in this last tool output ({where}) does and "
+                   "propose one concrete improvement to it. Do not repeat earlier answers.")
+STEP_TASK_DEFINITION = re.compile(r"^(?:async\s+def|def|class)\s+(\w+)", re.M)
+CHAT_REQUEST_ID_DIGITS = 16
+# Strata rejects prompt + max_tokens + 8 > context.
+CHAT_CONTEXT_SLACK = 8
+# A later point should reuse the whole previous prompt; this many tokens less is still a full reuse.
+CHAT_REUSE_TOLERANCE = 16
+# llama-server sampler names that OpenAI-style servers spell differently.
+CHAT_SAMPLER_NAMES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}
+
+
+def chat_request_id() -> str:
+    """Random request marker of fixed length: digit strings of one length tokenize to
+    the same number of tokens, so every request id gives the same prompt length."""
+    return f"{secrets.randbelow(10 ** CHAT_REQUEST_ID_DIGITS):0{CHAT_REQUEST_ID_DIGITS}d}"
+
+
+def chat_thinking_fields(thinking: str, api: str) -> Dict[str, Any]:
+    """--agent-thinking as request fields that give the same template kwargs on the
+    OpenAI and the Anthropic endpoint; auto keeps the server/template default."""
+    if thinking == "off":
+        return ({"chat_template_kwargs": {"enable_thinking": False}} if api == "openai"
+                else {"thinking": {"type": "disabled"}})
+    if thinking == "on":
+        return {"reasoning_effort": "high"} if api == "openai" else {"output_config": {"effort": "high"}}
+    return {}
+
+
+def chat_messages(system: str, turns: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """OpenAI chat messages; a past assistant turn carries its reasoning_content."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+    for turn in turns:
+        message: Dict[str, Any] = {"role": turn["role"], "content": turn["content"]}
+        if turn.get("reasoning"):
+            message["reasoning_content"] = turn["reasoning"]
+        messages.append(message)
+    return messages
+
+
+def count_chat_tokens(base: str, system: str, turns: List[Dict[str, str]], thinking: str,
+                      http: Optional[PostClient] = None) -> int:
+    """Prompt tokens of a conversation via /v1/messages/count_tokens (Anthropic API).
+
+    Strata renders and tokenizes the request there exactly as for a chat
+    completion, without running the model; the OpenAI API has no such endpoint.
+    """
+    messages: List[Dict[str, Any]] = []
+    for turn in turns:
+        content: Any = turn["content"]
+        if turn.get("reasoning"):
+            content = [{"type": "thinking", "thinking": turn["reasoning"]}, {"type": "text", "text": content}]
+        messages.append({"role": turn["role"], "content": content})
+    body = {"system": system, "messages": messages, **chat_thinking_fields(thinking, "anthropic")}
+    r = (http if http is not None else requests).post(f"{base}/v1/messages/count_tokens", json=body, timeout=600)
+    if not r.ok:
+        raise completion_error(r)
+    count = _int_or_none(r.json().get("input_tokens"))
+    if count is None or count <= 0:
+        raise PromptBuildError("/v1/messages/count_tokens returned no input_tokens")
+    return count
+
+
+class ChatPromptBuilder:
+    """--api openai-chat: a coding-agent conversation that grows by whole turns.
+
+    Strata reuses its conversation cache only from checkpoints taken where an
+    assistant turn starts, and only when the new prompt starts with exactly
+    their tokens. So instead of growing one tool result (as --scenario agent
+    does with token IDs), every later point appends, like an agent loop, the
+    model's reply to the previous point (its first measured repeat, see
+    set_reply) and a tool result with the next part of the input: the previous
+    point's prompt, generation prompt included, stays a prefix. A fixed reply
+    would be copied by the model, which then stops after a few tokens. Each
+    tool result ends with step_task (if any), see AGENT_STEP_TASK. Chunks
+    end at line breaks; the server counts the tokens. build() returns the chunk
+    ends as the prompt; the request id in the system message is chosen per
+    request (cold mode, warmup).
+    """
+    MAX_COUNT_CALLS = 12
+
+    def __init__(self, content: str, run: str, task: str, thinking: str, count: Any,
+                 chars_per_token: float, max_prompt_ctx: Optional[int] = None, step_task: str = "") -> None:
+        if not content:
+            raise PromptBuildError("the prompt source is empty")
+        self.content, self.run, self.task, self.thinking = content, run, task, thinking
+        self.step_task = step_task
+        self.step_texts: Dict[tuple[int, int], str] = {}
+        self.count = count  # (system, turns) -> prompt tokens
+        self.initial_density, self.max_prompt_ctx = chars_per_token, max_prompt_ctx
+        self.run_request_id = chat_request_id()
+        self.chunk_ends: List[int] = []
+        self.points: Dict[int, tuple[tuple[int, ...], int, int]] = {}
+        self.replies: Dict[int, tuple[str, str]] = {}  # chunk count -> (reasoning, answer)
+        self.reset()
+
+    def reset(self) -> None:
+        self.density = self.initial_density
+
+    def system(self, request_id: str) -> str:
+        return f"[ctx-cliff run={self.run} request={request_id}]\n{AGENT_SYSTEM_PROMPT}"
+
+    def set_reply(self, chunk_ends: Any, reasoning: str, answer: str) -> None:
+        """The reply to the prompt with these chunk ends: history of the next point."""
+        self.replies.setdefault(len(chunk_ends), (reasoning or "", answer or ""))
+
+    def step_text(self, start: int, end: int) -> str:
+        """The step task for the tool result content[start:end], {where} filled in."""
+        if "{where}" not in self.step_task:
+            return self.step_task
+        if (start, end) not in self.step_texts:
+            first = self.content.count("\n", 0, start) + 1
+            last = first + self.content.count("\n", start, max(start, end - 1))
+            names = STEP_TASK_DEFINITION.findall(self.content, start, end)
+            where = f"lines {first}-{last} of the file"
+            if len(names) > 1:
+                where += f", from `{names[0]}` to `{names[-1]}`"
+            elif names:
+                where += f", around `{names[0]}`"
+            self.step_texts[(start, end)] = self.step_task.replace("{where}", where)
+        return self.step_texts[(start, end)]
+
+    def turns(self, chunk_ends: Any) -> List[Dict[str, str]]:
+        turns = [{"role": "user", "content": self.task},
+                 {"role": "assistant", "content": CHAT_AGENT_ACK}]
+        start = 0
+        for index, end in enumerate(chunk_ends):
+            if index:
+                if index not in self.replies:
+                    raise PromptBuildError(f"no reply recorded for the conversation with {index} tool results")
+                reasoning, answer = self.replies[index]
+                turns.append({"role": "assistant", "content": answer, "reasoning": reasoning})
+            result = AGENT_CONTEXT_INTRO + self.content[start:end]
+            if self.step_task:
+                result = result.rstrip("\n") + "\n\n" + self.step_text(start, end)
+            turns.append({"role": "user", "content": result})
+            start = end
+        return turns
+
+    def tokens(self, chunk_ends: List[int]) -> int:
+        return self.count(self.system(self.run_request_id), self.turns(chunk_ends))
+
+    def _line_end(self, guess: float, low: int, high: Optional[int]) -> Optional[int]:
+        """A chunk end just after a line break, strictly between low and high."""
+        limit = len(self.content) if high is None else high - 1
+        guess = max(low + 1, min(int(guess), limit))
+        if guess >= len(self.content):
+            return len(self.content)
+        cut = self.content.rfind("\n", low, guess) + 1
+        if cut <= low:
+            cut = self.content.find("\n", guess, limit) + 1
+        return cut if low < cut <= limit else None
+
+    def build(self, ctx: int) -> tuple[tuple[int, ...], int, int]:
+        """Return (chunk ends, prompt tokens, covered input characters)."""
+        if self.max_prompt_ctx is not None:
+            ctx = min(ctx, self.max_prompt_ctx)
+        if ctx in self.points:
+            return self.points[ctx]
+        if self.points and ctx < max(self.points):
+            raise PromptBuildError(f"target {ctx} is below an already built point; chat prompts only grow")
+        start = self.chunk_ends[-1] if self.chunk_ends else 0
+        if start >= len(self.content):
+            return self.points[max(self.points)]  # nothing left: measure_point stops the sweep
+        base = self.tokens(self.chunk_ends + [start])  # the new turn with an empty tool result
+        if base >= ctx:
+            raise PromptBuildError(f"target {ctx} leaves no room for another tool result "
+                                   f"(the conversation with an empty one has {base} tokens)")
+        tolerance = max(32, ctx // 1000)
+        low, low_tokens, high = start, base, None
+        guess = start + (ctx - base) * self.density
+        for _ in range(self.MAX_COUNT_CALLS):
+            end = self._line_end(guess, low, high)
+            if end is None:
+                break
+            tokens = self.tokens(self.chunk_ends + [end])
+            if tokens <= ctx:
+                low, low_tokens = end, tokens
+                if ctx - tokens <= tolerance or end == len(self.content):
+                    break
+            else:
+                high = end
+            density = (end - start) / max(1, tokens - base)
+            guess = start + (ctx - base) * density * (0.995 if tokens > ctx else 1.0)
+        if low == start:
+            raise PromptBuildError(f"no line of the input fits the {ctx}-token target")
+        if ctx - low_tokens > max(tolerance, ctx // 50) and low < len(self.content):
+            print(f"WARNING: chat prompt for target {ctx} has only {low_tokens} tokens after "
+                  f"{self.MAX_COUNT_CALLS} token counts", file=sys.stderr)
+        self.density = (low - start) / max(1, low_tokens - base)
+        self.chunk_ends.append(low)
+        self.points[ctx] = (tuple(self.chunk_ends), low_tokens, low)
+        return self.points[ctx]
+
+
 def reset_slot(base: str, slot_id: int = 0, quiet: bool = False, http: Optional[RequestClient] = None) -> bool:
     """Erase one llama-server slot. The first endpoint is the documented one."""
     attempts = [('post', f'{base}/slots/{slot_id}?action=erase'), ('post', f'{base}/slots?action=erase&id_slot={slot_id}'), ('get', f'{base}/slots?action=erase&id_slot={slot_id}')]
@@ -2352,25 +2558,7 @@ def completion(base: str, prompt: str | List[int], n_predict: int, deterministic
     else:
         r = client.post(f'{base}/completion', json=payload, timeout=1800)
     if not r.ok:
-        body = r.text[:4000]
-        message = body or f'HTTP {r.status_code}'
-        error_type = ''
-        n_ctx = None
-        n_prompt_tokens = None
-        try:
-            data = r.json()
-            err = data.get('error', data) if isinstance(data, dict) else {}
-            if isinstance(err, dict):
-                message = str(err.get('message') or message)
-                error_type = str(err.get('type') or err.get('err_type') or '')
-                n_ctx = _int_or_none(err.get('n_ctx'))
-                n_prompt_tokens = _int_or_none(err.get('n_prompt_tokens'))
-            if isinstance(data, dict):
-                n_ctx = n_ctx or _int_or_none(data.get('n_ctx'))
-                n_prompt_tokens = n_prompt_tokens or _int_or_none(data.get('n_prompt_tokens'))
-        except (ValueError, TypeError):
-            pass
-        raise CompletionRequestError(r.status_code, message, error_type, n_ctx, n_prompt_tokens, body)
+        raise completion_error(r)
     if stream:
         try:
             return read_completion_stream(r.iter_lines())
@@ -2379,6 +2567,117 @@ def completion(base: str, prompt: str | List[int], n_predict: int, deterministic
             if close is not None:
                 close()
     return r.json()
+
+
+def completion_error(r: Any) -> CompletionRequestError:
+    """The server's error response (llama-server or OpenAI style) as an exception."""
+    body = r.text[:4000]
+    message = body or f'HTTP {r.status_code}'
+    error_type = ''
+    n_ctx = None
+    n_prompt_tokens = None
+    try:
+        data = r.json()
+        err = data.get('error', data) if isinstance(data, dict) else {}
+        if isinstance(err, dict):
+            message = str(err.get('message') or message)
+            error_type = str(err.get('type') or err.get('err_type') or '')
+            n_ctx = _int_or_none(err.get('n_ctx'))
+            n_prompt_tokens = _int_or_none(err.get('n_prompt_tokens'))
+        if isinstance(data, dict):
+            n_ctx = n_ctx or _int_or_none(data.get('n_ctx'))
+            n_prompt_tokens = n_prompt_tokens or _int_or_none(data.get('n_prompt_tokens'))
+    except (ValueError, TypeError):
+        pass
+    return CompletionRequestError(r.status_code, message, error_type, n_ctx, n_prompt_tokens, body)
+
+
+def chat_result(finish: Any, usage: Any, timings: Any, reasoning: str, answer: str,
+                first: Optional[float]) -> Dict[str, Any]:
+    """A chat completion in the fields _take_sample reads from llama-server's /completion."""
+    usage = usage if isinstance(usage, dict) else {}
+    return {"content": reasoning + answer, "reasoning": reasoning, "answer": answer,
+            "timings": timings if isinstance(timings, dict) else {},
+            "stop_type": finish, "truncated": False, "_first_token_mono": first,
+            "prompt_tokens": _int_or_none(usage.get("prompt_tokens"))}
+
+
+def read_chat_stream(lines: Any, clock: Any = time.perf_counter) -> Dict[str, Any]:
+    """Parse an OpenAI chat completion SSE stream; reasoning and answer text both count
+    as generated output. Strata sends usage and llama.cpp-style timings with the last chunk."""
+    first: Optional[float] = None
+    reasoning: List[str] = []
+    answer: List[str] = []
+    raw: List[str] = []
+    finish = usage = timings = None
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", "replace")
+        line = line.strip()
+        if not line or line.startswith(":"):  # SSE comments are keep-alives
+            continue
+        if not line.startswith("data:"):
+            raw.append(line)
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        chunk = json.loads(data)
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("error"):
+            error = chunk["error"] if isinstance(chunk["error"], dict) else {"message": str(chunk["error"])}
+            raise CompletionRequestError(500, str(error.get("message") or error), str(error.get("type") or ""))
+        choice = (chunk.get("choices") or [{}])[0] or {}
+        delta = choice.get("delta") or {}
+        if delta.get("reasoning_content") or delta.get("content") or delta.get("tool_calls"):
+            if first is None:
+                first = clock()
+            reasoning.append(delta.get("reasoning_content") or "")
+            answer.append(delta.get("content") or "")
+        finish = choice.get("finish_reason") or finish
+        usage = chunk.get("usage") or usage
+        timings = chunk.get("timings") or timings
+    if finish is None and timings is None:
+        if raw:
+            return chat_response(json.loads("\n".join(raw)))
+        raise CompletionRequestError(502, "streamed chat completion ended without a final chunk")
+    return chat_result(finish, usage, timings, "".join(reasoning), "".join(answer), first)
+
+
+def chat_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    choice = (data.get("choices") or [{}])[0] or {}
+    message = choice.get("message") or {}
+    return chat_result(choice.get("finish_reason"), data.get("usage"), data.get("timings"),
+                       message.get("reasoning_content") or "", message.get("content") or "", None)
+
+
+def chat_completion(base: str, system: str, turns: List[Dict[str, str]], n_predict: int, deterministic: bool,
+                    thinking: str, http: Optional[PostClient] = None, stream: bool = False,
+                    sampling: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One /v1/chat/completions request (--api openai-chat)."""
+    payload: Dict[str, Any] = {"messages": chat_messages(system, turns), "max_tokens": n_predict,
+                               "stream": stream, **chat_thinking_fields(thinking, "openai")}
+    for key, value in (sampling or {}).items():
+        payload[CHAT_SAMPLER_NAMES.get(key, key)] = value
+    if deterministic:
+        payload["temperature"] = 0.0
+        payload["top_k"] = 1
+    client = http if http is not None else requests
+    if stream:
+        r = client.post(f"{base}/v1/chat/completions", json=payload, timeout=1800, stream=True)
+    else:
+        r = client.post(f"{base}/v1/chat/completions", json=payload, timeout=1800)
+    if not r.ok:
+        raise completion_error(r)
+    if not stream:
+        return chat_response(r.json())
+    try:
+        return read_chat_stream(r.iter_lines())
+    finally:
+        close = getattr(r, "close", None)
+        if close is not None:
+            close()
 
 
 def rate_from_timing(t: Dict[str, Any], count_key: str, ms_key: str, rate_key: str) -> float:
@@ -3891,6 +4190,10 @@ class BenchmarkRunner:
         self.measurement_started = False
         self.previous_prompt_tokens: Optional[List[int]] = None
         self.snapshot_filename = f"ctx-cliff-{secrets.token_hex(12)}.bin"
+        # --api openai-chat: no slots to erase. A request id the server has not
+        # seen yet stands in for an erase (cold mode, warmup, drift check).
+        self.chat = isinstance(builder, ChatPromptBuilder)
+        self.chat_request_id = builder.run_request_id if self.chat else None
 
     def note(self, message: str) -> None:
         """Print a NOTE now, or keep it for below the live table while the sweep runs."""
@@ -3912,7 +4215,9 @@ class BenchmarkRunner:
             for store in stores:
                 store.end()
 
-    def build_prompt(self, ctx: int) -> tuple[List[int], int, int]:
+    def build_prompt(self, ctx: int) -> tuple[Any, int, int]:
+        if self.chat:
+            return self.builder.build(ctx)  # (chunk ends, server-counted tokens, input chars)
         text, _, target_chars = self.builder.build(ctx)
         cached = getattr(self.builder, "last_tokens", None)
         if not (isinstance(cached, tuple) and len(cached) == 2 and cached[0] == text):
@@ -3977,6 +4282,10 @@ class BenchmarkRunner:
                 if self.args.settle:
                     time.sleep(self.args.settle)
             sample = self.take_sample(prompt, ctx, repeat)
+            if self.chat:
+                self.check_chat_sample(sample, ctx, total_ctx, repeat, record)
+                if record and repeat == 0:
+                    self.builder.set_reply(prompt, *getattr(self, "last_chat_reply", ("", "")))
             validation_error = ""
             if saved_tokens is not None and sample["cache_n"] != saved_tokens:
                 validation_error = (
@@ -3992,7 +4301,10 @@ class BenchmarkRunner:
                         f"(cache_n, prompt_n)={actual}, expected {expected}. "
                         "The server did not reproduce the same prefix work after restore.")
             guard_error: Optional[GuardAbortError] = None
-            if not validation_error:
+            # Without snapshots, later repeats find the whole prompt cached: their few
+            # prompt tokens are no prefill measurement and must not trip the guards.
+            measures_prefill = repeat == 0 or prefill_mode(self.args) != "first_repeat_only"
+            if not validation_error and measures_prefill:
                 if message := self.check_sysmem_fallback(sample, ctx, repeat):
                     guard_error = SysmemFallbackError(message)
                 elif record and (message := self.check_prefill_floor(sample, ctx, repeat)):
@@ -4011,6 +4323,8 @@ class BenchmarkRunner:
             if validation_error:
                 raise RuntimeError(validation_error)
             samples.append(sample)
+        if self.chat and record:
+            self.check_chat_copy(samples, ctx)
         row = aggregate_point(samples, ctx, total_ctx, target_chars, self.args)
         if (row.get("output_variants") or 0) > 1 and getattr(self.args, "deterministic", False):
             self.note(f"NOTE target={ctx}: {row['output_variants']} different outputs across "
@@ -4023,6 +4337,33 @@ class BenchmarkRunner:
         if repeated_incremental:
             self.previous_prompt_tokens = prompt_tokens
         return row
+
+    def check_chat_sample(self, sample: Dict[str, Any], ctx: int, total_ctx: int, repeat_idx: int,
+                          record: bool) -> None:
+        """--api openai-chat NOTEs: prompt size as the server read it, and lost cache reuse."""
+        read = getattr(self, "last_chat_prompt_tokens", None)
+        if read is not None and read != total_ctx and not getattr(self, "chat_count_noted", False):
+            self.chat_count_noted = True
+            self.note(f"NOTE target={ctx}: the server read {read} prompt tokens, /v1/messages/count_tokens "
+                      f"counted {total_ctx}; the ctx column uses the count")
+        previous = getattr(self, "last_total_ctx", None)
+        if (record and repeat_idx == 0 and self.args.cache_mode == "incremental" and previous is not None
+                and sample["cache_n"] < previous - CHAT_REUSE_TOLERANCE):
+            self.note(f"NOTE target={ctx}: the server reused only {sample['cache_n']} of the previous point's "
+                      f"{previous} prompt tokens, so this prefill re-read part of the history")
+
+    def check_chat_copy(self, samples: List[Dict[str, Any]], ctx: int) -> None:
+        """NOTE once when a point's reply equals the previous point's: the model copies
+        its history, so draft acceptance and decode t/s measure the copy, not the context."""
+        digest = samples[0].get("output_sha256") if samples else None
+        if (digest and digest == getattr(self, "previous_output_sha256", None)
+                and not getattr(self, "chat_copy_noted", False)):
+            self.chat_copy_noted = True
+            self.note(f"NOTE target={ctx}: the reply is identical to the previous point's (output_sha256 "
+                      f"{digest}); the model copies its earlier reply, which inflates draft acceptance and "
+                      "decode t/s. Use sampling (e.g. --temperature 0.6 --top-p 0.95 --top-k 20 --seed 1) "
+                      "or another --agent-step-task")
+        self.previous_output_sha256 = digest
 
     def check_sysmem_fallback(self, sample: Dict[str, Any], ctx: int, repeat_idx: int) -> str:
         """Return an abort reason for --sysmem-guard abort, print a NOTE for warn, else ''."""
@@ -4070,7 +4411,9 @@ class BenchmarkRunner:
         (slot erased, full prefill for every repeat), without writing CSV rows."""
         self.measurement_started = False
         self.previous_prompt_tokens = None
-        if self.args.cache_mode == "incremental":
+        if self.chat:
+            self.chat_request_id = chat_request_id()
+        elif self.args.cache_mode == "incremental":
             reset_slot(self.base, self.args.slot_id, quiet=True, http=self.http)
         return self.measure_point(ctx, record=False)
 
@@ -4103,7 +4446,7 @@ class BenchmarkRunner:
         prompt: str | List[int], target_ctx: int, repeat_idx: int, phase: str = "measure"
     ) -> Dict[str, Any]:
         self.recording.check()
-        if self.args.cache_mode == "cold":
+        if self.args.cache_mode == "cold" and not self.chat:
             if not reset_slot(self.base, self.args.slot_id, http=self.http):
                 raise RuntimeError(f"Cold measurement requires a successful erase of slot {self.args.slot_id}")
             if self.args.settle:
@@ -4121,18 +4464,28 @@ class BenchmarkRunner:
         reuse_prompt = self.args.cache_mode == "incremental" and not first_measurement
         sampling = sampling_payload(self.args, repeat_idx)
         try:
-            resp = completion(
-                self.base,
-                prompt,
-                self.args.n_predict,
-                self.args.deterministic,
-                cache_prompt=reuse_prompt,
-                slot_id=self.args.slot_id,
-                ignore_eos=self.args.ignore_eos,
-                http=self.http,
-                **({"stream": True} if getattr(self.args, "stream", False) else {}),
-                **({"sampling": sampling} if sampling else {}),
-            )
+            if self.chat:
+                fresh = self.args.cache_mode == "cold" or phase == "warmup"
+                request_id = chat_request_id() if fresh else self.chat_request_id
+                resp = chat_completion(
+                    self.base, self.builder.system(request_id), self.builder.turns(prompt),
+                    self.args.n_predict, self.args.deterministic, self.builder.thinking, http=self.http,
+                    stream=getattr(self.args, "stream", False), sampling=sampling)
+                self.last_chat_prompt_tokens = resp.get("prompt_tokens")
+                self.last_chat_reply = (resp.get("reasoning") or "", resp.get("answer") or "")
+            else:
+                resp = completion(
+                    self.base,
+                    prompt,
+                    self.args.n_predict,
+                    self.args.deterministic,
+                    cache_prompt=reuse_prompt,
+                    slot_id=self.args.slot_id,
+                    ignore_eos=self.args.ignore_eos,
+                    http=self.http,
+                    **({"stream": True} if getattr(self.args, "stream", False) else {}),
+                    **({"sampling": sampling} if sampling else {}),
+                )
         finally:
             monitor_end = time.perf_counter()
             if self.vram_monitor is not None:
@@ -4228,7 +4581,7 @@ COMPARE_METRICS = (
 )
 # Different values here mean a different workload; the other settings only change
 # the generated text (relevant for MTP/drafting acceptance).
-WORKLOAD_SETTINGS = ("scenario", "cache_mode", "n_predict", "input_sha256")
+WORKLOAD_SETTINGS = ("scenario", "api", "cache_mode", "n_predict", "input_sha256")
 
 
 def describe_setting_difference(reference: Any, run: Any) -> str:
@@ -4369,11 +4722,13 @@ def run_settings(arguments: Dict[str, Any], prompt: Dict[str, Any], input_sha256
     agent = prompt.get("agent") or {}
     return {
         "scenario": prompt.get("scenario") or "file",
+        "api": arguments.get("api") or "llama",
         "cache_mode": arguments.get("cache_mode"),
         "n_predict": arguments.get("n_predict"),
         "deterministic": arguments.get("deterministic"),
         "sampling": prompt.get("sampling_first_repeat"),
         "agent_task": agent.get("task"),
+        "agent_step_task": agent.get("step_task"),
         "agent_thinking": agent.get("thinking"),
         "input_sha256": input_sha256,
     }
@@ -4582,6 +4937,9 @@ examples:
   # Coding-agent turn: growing file excerpt in a chat conversation, same task at every point
   python ctx-cliff.py --file data/django.py --scenario agent --temperature 0.6 --top-k 20 --seed 1 --n-predict 512
 
+  # Chat server without /completion (e.g. Strata): the conversation grows by tool-result turns
+  python ctx-cliff.py --file data/django.py --api openai-chat --scenario agent --n-predict 256
+
   # NVIDIA clocks/power/VRAM + Windows dedicated/shared GPU memory
   python ctx-cliff.py --file data/django.py --vram-log nvidia --vram-interval-ms 250 --vram-csv outputs/nvidia-trace.csv --win-gpu-mem-csv outputs/wddm-trace.csv
 
@@ -4709,6 +5067,14 @@ notes:
         help="llama-server slot to pin the benchmark to (default: %(default)s)",
     )
     g.add_argument(
+        "--api",
+        choices=("llama", "openai-chat"),
+        default="llama",
+        help=("llama: llama-server's /completion with token IDs (default); openai-chat: "
+              "/v1/chat/completions for servers without it, e.g. Strata - needs --scenario agent, "
+              "counts tokens with /v1/messages/count_tokens, no slot erase/snapshots or --ignore-eos"),
+    )
+    g.add_argument(
         "--server-command",
         default=None,
         metavar="COMMAND",
@@ -4829,10 +5195,11 @@ notes:
         help="skip re-measuring the first point after the sweep (drift check against heat/clock changes)",
     )
     g.add_argument(
-        "--sysmem-guard", choices=("abort", "warn", "off"), default="abort",
+        "--sysmem-guard", choices=("abort", "warn", "off"), default=None,
         help=("stop the sweep (abort), print a NOTE (warn) or do nothing (off) when the prefill PCIe "
               "receive median reaches --sysmem-guard-mb-s, i.e. GPU memory overflows into shared "
-              "system memory (default: %(default)s; use off for intentional CPU offload)"),
+              "system memory (default: abort, off with --api openai-chat, as Strata streams experts "
+              "over PCIe by design; use off for intentional CPU offload)"),
     )
     g.add_argument(
         "--sysmem-guard-mb-s", type=float, default=SYSMEM_GUARD_DEFAULT_MB_S, metavar="MB_S",
@@ -4869,6 +5236,16 @@ notes:
         default=None,
         metavar="TEXT",
         help="with --scenario agent: fixed instruction after the context (default: a built-in coding task)",
+    )
+    g.add_argument(
+        "--agent-step-task",
+        default=None,
+        metavar="TEXT",
+        help=("with --api openai-chat: instruction at the end of every tool result, so each reply "
+              "discusses new code; {where} becomes its line range and first/last definition (default: "
+              "explain the last tool output ({where}) and propose an improvement); "
+              "none = only the --agent-task at the start, which the model tends to answer again and "
+              "again - suffix drafting then accepts nearly every draft"),
     )
     g.add_argument(
         "--agent-thinking",
@@ -5070,6 +5447,16 @@ notes:
         ap.error("--agent-task/--agent-thinking require --scenario agent")
     if args.agent_task is not None and not args.agent_task.strip():
         ap.error("--agent-task must not be empty")
+    if args.agent_step_task is not None and args.api != "openai-chat":
+        ap.error("--agent-step-task requires --api openai-chat")
+    if args.agent_step_task is not None and not args.agent_step_task.strip():
+        ap.error("--agent-step-task must not be empty (use none to disable it)")
+    if args.api == "openai-chat" and args.scenario != "agent":
+        ap.error("--api openai-chat requires --scenario agent (a chat server has no raw text completion)")
+    if args.api == "openai-chat" and args.ignore_eos:
+        ap.error("--ignore-eos is not available with --api openai-chat")
+    if args.sysmem_guard is None:
+        args.sysmem_guard = "off" if args.api == "openai-chat" else "abort"
     args.sampler = dict(args.sampler or [])
     if args.sysmem_guard_mb_s <= 0:
         ap.error("--sysmem-guard-mb-s must be > 0")
@@ -5174,7 +5561,8 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
         else:
             vram_settle = settle_vram_before_server_start(args)
             managed_server = ManagedLlamaServer(
-                command=prepare_snapshot_command(args.server_command, args),
+                command=(args.server_command if getattr(args, "api", "llama") == "openai-chat"
+                         else prepare_snapshot_command(args.server_command, args)),
                 base=base,
                 startup_timeout=args.server_start_timeout,
                 log_path=args.server_log,
@@ -5228,9 +5616,34 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
     nonce_value = getattr(args, "nonce", None) or secrets.token_hex(8)
     nonce = f"[ctx-cliff run={nonce_value}] "
     scenario = getattr(args, "scenario", "file")
+    chat = getattr(args, "api", "llama") == "openai-chat"
     prompt_prefix, suffix_tokens, add_bos = nonce, [], True
     agent_meta: Optional[Dict[str, Any]] = None
-    if scenario == "agent":
+    chat_builder: Optional[ChatPromptBuilder] = None
+    if chat:
+        task = getattr(args, "agent_task", None) or AGENT_DEFAULT_TASK
+        thinking = getattr(args, "agent_thinking", "auto")
+        step_task = getattr(args, "agent_step_task", None)
+        step_task = AGENT_STEP_TASK if step_task is None else ("" if step_task == "none" else step_task)
+        chat_builder = ChatPromptBuilder(
+            file_content, nonce_value, task, thinking,
+            lambda system, turns: count_chat_tokens(base, system, turns, thinking, http=http), 4.0,
+            step_task=step_task)
+        cut = file_content.rfind("\n", 0, 10000) + 1 or min(len(file_content), 10000)
+        try:
+            nonce_tokens = chat_builder.tokens([0])  # the conversation with an empty tool result
+            chars_per_token = cut / max(1, chat_builder.tokens([cut]) - nonce_tokens)
+        except (requests.RequestException, CompletionRequestError, PromptBuildError, KeyError, ValueError) as e:
+            print(f"ERROR: --api openai-chat counts prompt tokens with /v1/messages/count_tokens "
+                  f"(Strata); it failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        chat_builder.initial_density = chars_per_token
+        agent_meta = {"task": task, "step_task": step_task, "thinking": thinking,
+                      "run_request_id": chat_builder.run_request_id,
+                      "system_text": chat_builder.system(chat_builder.run_request_id),
+                      "assistant_ack": CHAT_AGENT_ACK, "history_replies": "first measured repeat",
+                      "tool_result_intro": AGENT_CONTEXT_INTRO}
+    elif scenario == "agent":
         task = getattr(args, "agent_task", None) or AGENT_DEFAULT_TASK
         try:
             prompt_prefix, suffix = agent_prompt_parts(base, nonce.strip(), task,
@@ -5247,20 +5660,23 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
         agent_meta = {"task": task, "thinking": getattr(args, "agent_thinking", "auto"),
                       "prefix_text": prompt_prefix, "suffix_text": suffix,
                       "suffix_tokens": len(suffix_tokens), "add_bos": add_bos}
-    nonce_tokens = len(tokenize(base, prompt_prefix, add_bos=add_bos, http=http))
-    chunk = file_content[:10000]
-    chunk_tokens = len(tokenize(base, chunk, add_bos=False, http=http))
-    chars_per_token = len(chunk) / max(1, chunk_tokens)
+    if not chat:
+        nonce_tokens = len(tokenize(base, prompt_prefix, add_bos=add_bos, http=http))
+        chunk = file_content[:10000]
+        chunk_tokens = len(tokenize(base, chunk, add_bos=False, http=http))
+        chars_per_token = len(chunk) / max(1, chunk_tokens)
 
     print(
         f"input loaded: {args.file} ({len(file_content)} chars) | "
         f"estimate {chars_per_token:.2f} chars/token | "
-        + (f"agent prefix {nonce_tokens} tok, suffix {len(suffix_tokens)} tok" if scenario == "agent"
+        + (f"chat conversation without tool output {nonce_tokens} tok" if chat
+           else f"agent prefix {nonce_tokens} tok, suffix {len(suffix_tokens)} tok" if scenario == "agent"
            else f"nonce {nonce_tokens} tok"),
         file=sys.stderr,
     )
     print(
-        f"test mode={args.cache_mode} slot={args.slot_id} repeat={args.repeat} "
+        f"test mode={args.cache_mode} " + ("api=openai-chat " if chat else f"slot={args.slot_id} ")
+        + f"repeat={args.repeat} "
         f"n_predict={args.n_predict} deterministic={args.deterministic} "
         f"ignore_eos={args.ignore_eos} scenario={scenario}"
         + "".join(f" {key}={value}" for key, value in sampling_payload(args, 0).items()),
@@ -5269,12 +5685,15 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
 
     server_n_ctx = detect_slot_n_ctx(base, args.slot_id, http=http)
     max_prompt_ctx: Optional[int] = None
+    if server_n_ctx is None and chat:
+        print("NOTE: the server reported no context size (model not loaded yet?); the sweep stops "
+              "at the first point the server rejects as too long.", file=sys.stderr)
     if server_n_ctx:
         # Reserve the requested decode window so every valid sample can actually
         # produce n_predict tokens without running off the end of the slot. The
         # extra token: llama-server flags `truncated` once prompt + generated
         # tokens reach n_ctx, even if the n_predict-th token was still produced.
-        max_prompt_ctx = server_n_ctx - args.n_predict - 1
+        max_prompt_ctx = server_n_ctx - args.n_predict - 1 - (CHAT_CONTEXT_SLACK if chat else 0)
         if max_prompt_ctx <= 0:
             ap.error("--n-predict leaves no prompt budget in the server context")
         print(
@@ -5301,7 +5720,8 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
         "nonce_tokens": nonce_tokens, "chars_per_token_estimate": round(chars_per_token, 4),
         "input_chars": len(file_content), "server_slot_n_ctx": server_n_ctx,
         "max_prompt_ctx": max_prompt_ctx,
-        "scenario": scenario, "agent": agent_meta, "sampling_first_repeat": sampling_payload(args, 0),
+        "scenario": scenario, "api": getattr(args, "api", "llama"), "agent": agent_meta,
+        "sampling_first_repeat": sampling_payload(args, 0),
     }
     meta.update(prompt=prompt_meta)
 
@@ -5443,14 +5863,19 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
               f"({len(reachable)} of {len(ctxs)} points reachable). Use a larger input file.", file=sys.stderr)
     meta.update(input_estimated_tokens=estimated_file_tokens)
 
-    builder = PromptBuilder(file_content, prompt_prefix,
-                            lambda prompt: tokenize(base, prompt, add_bos=add_bos, http=http),
-                            chars_per_token, nonce_tokens, max_prompt_ctx,
-                            detokenize=lambda ids: detokenize(base, ids, http=http),
-                            suffix_tokens=suffix_tokens)
+    builder: Any
+    if chat_builder is not None:
+        builder = chat_builder
+        builder.max_prompt_ctx = max_prompt_ctx
+    else:
+        builder = PromptBuilder(file_content, prompt_prefix,
+                                lambda prompt: tokenize(base, prompt, add_bos=add_bos, http=http),
+                                chars_per_token, nonce_tokens, max_prompt_ctx,
+                                detokenize=lambda ids: detokenize(base, ids, http=http),
+                                suffix_tokens=suffix_tokens)
     runner = BenchmarkRunner(args, base, http, builder, recording, vram_monitor, gpm_monitor, win_gpu_monitor)
     runner.vram_before_start_mib = vram_settle["final_mib"] if vram_settle else None
-    uses_snapshots = args.cache_mode == "incremental" and args.repeat > 1
+    uses_snapshots = args.cache_mode == "incremental" and args.repeat > 1 and not chat
     if uses_snapshots and not getattr(args, "keep_snapshot", False):
         directory = snapshot_directory_from_command(managed_server.command) if managed_server is not None else None
         if directory is not None:
@@ -5460,7 +5885,13 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
             print(f"NOTE: automatic snapshot deletion unavailable for this server; "
                   f"if created, remove {runner.snapshot_filename} from its slot-save directory manually. "
                   "The server API has no file-delete action.", file=sys.stderr)
-    probe_prefill_repeats(args, base, runner.snapshot_filename, http=http)
+    if chat:
+        # No slot snapshots: repeat 1 reads the new turn, later repeats find the
+        # whole prompt cached and only measure decode.
+        args.prefill_repeat_enabled = False
+        args.prefill_repeat_error = "the OpenAI chat API has no slot snapshots"
+    else:
+        probe_prefill_repeats(args, base, runner.snapshot_filename, http=http)
     meta.update(measurement={
         "prefill_mode": prefill_mode(args),
         "prefill_repeat_enabled": getattr(args, "prefill_repeat_enabled", None),
@@ -5485,7 +5916,7 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
             warm_prompt, _, _ = runner.build_prompt(ctxs[0])
             print(f"warmup: {args.warmup} sample(s) @ ~{ctxs[0]} tok", file=sys.stderr)
             for i in range(args.warmup):
-                if args.cache_mode == "incremental" and i == 0:
+                if args.cache_mode == "incremental" and i == 0 and not chat:
                     reset_slot(base, args.slot_id, quiet=True, http=http)
                 warm_sample = runner.take_sample(warm_prompt, ctxs[0], i, phase="warmup")
                 if message := runner.check_sysmem_fallback(warm_sample, ctxs[0], i):
@@ -5498,7 +5929,7 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
 
     # Best-effort reset before the sweep. BenchmarkRunner also disables reuse for
     # the first real request, so a retained warmup checkpoint cannot shrink prefill.
-    if args.cache_mode == "incremental":
+    if args.cache_mode == "incremental" and not chat:
         reset_slot(base, args.slot_id, http=http)
         if args.settle:
             time.sleep(args.settle)

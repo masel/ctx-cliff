@@ -2,7 +2,9 @@
 
 A benchmark for [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`
 that measures how prefill and decode speed change as the prompt context grows,
-and records GPU telemetry while it does so.
+and records GPU telemetry while it does so. With `--api openai-chat` it also
+measures chat servers without llama-server's `/completion` API, such as
+[Strata](https://github.com/Niko1221/Strata).
 
 It steps through increasing context sizes (for example 10k, 20k, … 120k tokens),
 runs several completion requests at each point and reports:
@@ -28,7 +30,8 @@ It does **not** measure answer quality.
   python -m pip install requests nvidia-ml-py
   ```
 - A `llama-server` (upstream llama.cpp or a fork), either already running or
-  started by the script via `--server-command`.
+  started by the script via `--server-command`; or, with `--api openai-chat`, a
+  running Strata server (`/v1/chat/completions` and `/v1/messages/count_tokens`).
 - A large UTF-8 text file as prompt source. `data/` contains two: Django's
   source code (`data/django.py`) and *War and Peace* (`data/war_and_peace.txt`).
 - Optional: an NVIDIA GPU and driver for telemetry. Missing telemetry sources are
@@ -73,6 +76,16 @@ python ctx-cliff.py --file data/django.py --scenario agent \
 Sampler values belong in the script options, not in `--server-command`: the
 script sends them with every request and gives each repeat its own seed.
 
+**Chat server without `/completion`, for example Strata.** The conversation grows
+by tool-result turns like an agent loop; sampling keeps the model from copying
+its earlier replies:
+
+```bash
+python ctx-cliff.py --file data/django.py --api openai-chat --scenario agent \
+  --start 8000 --end 128000 --step 8000 --repeat 2 --n-predict 256 \
+  --temperature 0.6 --top-p 0.95 --top-k 20 --seed 1 --csv
+```
+
 **Compare runs** (reference first; works across builds, settings and models):
 
 ```bash
@@ -101,6 +114,7 @@ One row per context point:
 | `draft` | Accepted / proposed draft tokens; only shown when drafting is active. |
 | `step` | Median cost of one decode step in ms. With drafting this reflects the context cost regardless of how predictable the generated text is. |
 | `free` | Lowest free VRAM seen during the point. |
+| `clock` | GPU SM clock median/min in MHz; a low value means the GPU did not run at full boost. |
 | `PF/DC …` | Prefill/decode PCIe traffic, link saturation and GPU engine utilization. |
 | `status` | `OK`, or for example `2/3 OK` if repeats were invalid. |
 
@@ -117,11 +131,12 @@ check (first point measured again), the cliff analysis and, with
 | `--n-predict` | 64 | Tokens to generate per request. |
 | `--cache-mode` | incremental | `incremental` reuses the common prefix like a growing conversation; `cold` processes the full prompt every time. |
 | `--scenario` | file | `file`: continue the input file; `agent`: chat conversation with growing file excerpt and fixed task. |
+| `--api` | llama | `llama`: llama-server's `/completion`; `openai-chat`: `/v1/chat/completions` (Strata), needs `--scenario agent`. |
 | `--deterministic` | off | Greedy decoding (`temperature=0`, `top_k=1`). |
 | `--temperature`, `--top-p`, `--top-k`, `--min-p`, … | server | Sampling settings sent with every request; `--sampler KEY=VALUE` for any other field. |
 | `--nonce TEXT` | random | Fixed run marker, so A/B runs use identical prompts. |
 | `--reference CSV` / `--compare REF RUN …` | – | Compare with earlier runs. |
-| `--sysmem-guard` | abort | Stop when the driver spills VRAM into system memory. |
+| `--sysmem-guard` | abort | Stop when the driver spills VRAM into system memory (`off` with `--api openai-chat`). |
 | `--abort-below-pct` | 20 | Stop when prefill drops below this share of the first point. |
 
 `python ctx-cliff.py --help` lists all options. [docs/details.md](docs/details.md)
@@ -139,6 +154,11 @@ detection and the helper scripts `pcie-calibrate.py` and `gpm-probe.py` in detai
   measured by a profiler.
 - Incremental repeats rely on slot save/restore (`--slot-save-path`); without it
   the script falls back to measuring prefill only once per point.
+- `--api openai-chat` measures prefill once per point (no slot snapshots),
+  counts tokens through Strata's `/v1/messages/count_tokens` and cannot force
+  `n_predict` tokens (`--ignore-eos`). Its decode rate depends on the generated
+  text more than with llama-server; see
+  [docs/details.md](docs/details.md#chat-servers-without-completion---api-openai-chat).
 
 ## Tests
 

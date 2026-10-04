@@ -31,7 +31,8 @@ python ctx-cliff.py --file data/django.py --start 1000 --end 100000 --step 10000
 ```
 
 The default address is `http://127.0.0.1:8080`; use `--base-url` for another one.
-The server needs `/health`, `/tokenize` and `/completion`.
+The server needs `/health`, `/tokenize` and `/completion`; for chat-only servers see
+[`--api openai-chat`](#chat-servers-without-completion---api-openai-chat).
 
 ### Starting and stopping the server automatically
 
@@ -119,9 +120,9 @@ draft columns `mtp_*`; they are still read.
 
 If the `.meta.json` files are present, the script shows the differences between
 the server commands (for example `--ctx-size`, `--spec-type`) and checks the
-settings: differences in scenario, `--cache-mode`, `--n-predict` or input file
-give a `WARNING` (different workload); differences in sampler, task, thinking mode
-or `--deterministic` give a `NOTE` (different generated text, which matters for
+settings: differences in scenario, `--api`, `--cache-mode`, `--n-predict` or input
+file give a `WARNING` (different workload); differences in sampler, task, step
+task, thinking mode or `--deterministic` give a `NOTE` (different generated text, which matters for
 drafting). With several runs a matrix of decode changes follows, one column per
 run.
 
@@ -159,6 +160,80 @@ results. The server needs a chat template (`/apply-template`).
 `--agent-thinking on|off` sets `enable_thinking` for the template; `auto` keeps
 the template default. Rendering, prefix and suffix tokens are stored in
 `.meta.json` under `prompt.agent`.
+
+### Chat servers without `/completion` (`--api openai-chat`)
+
+```bash
+python ctx-cliff.py --file data/django.py --api openai-chat --scenario agent --start 8000 --end 128000 --step 8000 --repeat 2 --n-predict 256 --temperature 0.6 --top-p 0.95 --top-k 20 --seed 1 --csv
+```
+
+Some servers only speak the OpenAI chat API, for example
+[Strata](https://github.com/Niko1221/Strata), an engine that runs a large MoE
+model with its experts spread over VRAM, RAM and SSD. They have no `/tokenize`,
+no `/completion` with token IDs and no slot erase or snapshots. With
+`--api openai-chat` (only together with `--scenario agent`) the script sends
+`/v1/chat/completions` and counts prompt tokens with
+`/v1/messages/count_tokens`, which renders and tokenizes the conversation like a
+chat request without running the model. Strata provides both and returns
+llama.cpp-style `timings` (`cache_n`, `prompt_n`, `prompt_ms`, `predicted_n`,
+`predicted_ms`, `draft_n`, `draft_n_accepted`), so all columns are filled as with
+llama-server.
+
+**The conversation grows by turns.** Strata reuses its conversation cache only
+from checkpoints taken where an assistant turn starts, and only when the new
+prompt starts with exactly their tokens. A file excerpt that grows inside one
+message, as in the llama-server agent scenario, would therefore be read again
+from the start. Instead each point extends the previous point's conversation the
+way an agent loop does:
+
+1. system prompt with run marker and request id (see below),
+2. the task (`--agent-task`) and a fixed acknowledgement,
+3. per point: the model's reply to the previous point (reasoning and answer of
+   its first measured repeat) and a new tool result with the next part of
+   `--file`, cut at a line break and sized so that the prompt reaches the target.
+
+The previous prompt, generation prompt included, stays a prefix of the next one,
+and `new` shows only the new turn (plus the previous reply if the cache holds a
+different repeat's reply). A fixed assistant text instead of the real reply does
+not work: the model copies it and stops after a few tokens.
+
+**Every tool result ends with a step task** (`--agent-step-task`). The default asks
+the model to explain the code of that tool result and propose an improvement,
+naming its lines and first/last definition (`{where}`, for example
+`lines 912-1974 of the file, from Settings to gettext_noop`). With the same task
+at every point the model rewrites its previous answer word for word; Strata's
+suffix drafter, which proposes what followed the current text earlier in the
+context, then accepts nearly every draft. Tokens per step rose from about 2 to 5
+in such a run, and decode t/s with them: the copy speed, not a context effect.
+A fixed step wording is not enough with greedy decoding either, because each reply
+starts by quoting it. `--agent-step-task none` restores the plain task, for
+example to measure rewriting on purpose; your own text may contain `{where}`.
+Use sampling settings (the example uses Qwen's recommendations): sampled replies
+differ between points. If a reply is nevertheless identical to the previous
+point's, a note says so once.
+
+**No slots.** A request id in the system message stands in for a slot erase: the
+warmup, the drift check and every request in `cold` mode use an id the server has
+not seen, so nothing is cached; the measured incremental points share the run's
+id. Ids are 16 digits, so every id gives the same prompt length. Prefill is
+measured by the first repeat of each point; later repeats find the whole prompt
+cached and measure decode only (`prefill_mode` `first_repeat_only`, as in the
+[snapshot fallback](#fallback-without-snapshot-support)).
+
+**Checks.** Notes appear when the server read a different number of prompt tokens
+than `count_tokens` counted, when a point reused less than the previous point's
+prompt, and when replies repeat. The sysmem guard defaults to `off`, because
+Strata streams experts over PCIe by design (about 7 GB/s during prefill in a
+test run). The usable prompt length is the server context minus
+`--n-predict` minus 9 tokens (Strata keeps 8 tokens of slack).
+
+**Strata specifics.** With thinking enabled and a small `--n-predict` Strata logs
+"the reply reached max tokens while still thinking, so it has no answer"; that is
+expected, thinking tokens are decoded like any other. Its adaptive expert cache
+(hit rate in the server log) makes decode vary more between repeats than with
+llama-server, so prefer two or more repeats. `--ignore-eos` is not available;
+replies that end before `--n-predict` are `STOP` samples and excluded from the
+decode median.
 
 ### Sampling settings
 
@@ -361,6 +436,7 @@ then combined per context point. Not all values are means.
 | `draft` | `100 × sum of accepted draft tokens / sum of proposed draft tokens` over all repeats; `n/a` without drafts at the point. Covers every kind of drafting llama-server reports in `timings.draft_n`/`draft_n_accepted` (MTP, DFlash, draft model, n-gram). The column appears when drafting was detected during the warmup or at the first point. CSV: `draft_n`, `draft_acc`, `draft_acc_pct`. |
 | `step ms` | Median cost of one verification step, `predicted_ms / (predicted_n − draft_n_accepted)`, over valid decode repeats; only with active drafting. Independent of how predictable the generated text is (see [Decode with drafting](#decode-with-drafting)). |
 | `free` | **Lowest free VRAM** during all requests of the point, prefill and decode together; MiB. |
+| `clock` | GPU SM clock median/min over the point in MHz (CSV: `gpu_clock_median_mhz`, `gpu_clock_min_mhz`); a low value means the GPU did not run at full boost. |
 | `power` | Mean of all valid power samples during the requests, weighted by the number of valid samples; W. |
 | `PF/DC PCIe` | GPM receive/transmit in MiB/s: first p95 per repeat and phase, then the median of these p95 values. |
 | `PF/DC sat` | Share of valid GPU interval time with **at least 90 %** of the theoretical PCIe link rate. |
@@ -844,7 +920,8 @@ Two guards check every single repeat and end the run as soon as further points
 would give nothing useful. In a series of runs the next one then starts without
 losing time.
 
-- **Sysmem fallback (`--sysmem-guard`, default `abort`):** if the median PCIe
+- **Sysmem fallback (`--sysmem-guard`, default `abort`, `off` with
+  `--api openai-chat`):** if the median PCIe
   receive rate during prefill reaches `--sysmem-guard-mb-s` (default 1000), the run
   is stopped (`warn`: note only, `off`: disabled); see
   [Sysmem fallback on Windows](#sysmem-fallback-on-windows). This also applies to
@@ -857,6 +934,10 @@ losing time.
   normally with context (example: to about 40 % at 160k); 20 % would only be
   reached at around 400k there. `0` disables the check. The drift check at the end
   is not checked.
+
+With `prefill_mode` `first_repeat_only` only the first repeat of a point is
+checked: later repeats read just a few uncached tokens, whose rate is no prefill
+measurement.
 
 The triggering repeat is recorded with the reason (`validation_error`) in
 `.samples.csv`; its point does not appear in the result CSV. Completed points are
@@ -1008,6 +1089,8 @@ python ctx-cliff.py --help
 | `--scenario` | file | `file`: continue the file; `agent`: chat conversation with growing file excerpt and fixed task. |
 | `--agent-task TEXT` | built-in | Fixed task at the end of the agent prompt. |
 | `--agent-thinking` | auto | `enable_thinking` of the chat template: `on`, `off` or template default. |
+| `--api` | llama | `llama`: llama-server's `/completion` with token IDs; `openai-chat`: `/v1/chat/completions` and `/v1/messages/count_tokens` (Strata), needs `--scenario agent`. |
+| `--agent-step-task TEXT` | built-in | With `--api openai-chat`: instruction at the end of every tool result, `{where}` = its lines and definitions; `none` = no step task. |
 | `--temperature / --top-p / --top-k / --min-p / --typical-p` | server | Sampling settings for every request (also with underscores). |
 | `--repeat-penalty / --repeat-last-n / --presence-penalty / --frequency-penalty` | server | Penalties for every request; `--repetition-penalty` is an alias. |
 | `--sampler KEY=VALUE` | – | Any other llama-server sampling field, repeatable. |
@@ -1023,7 +1106,7 @@ python ctx-cliff.py --help
 | `--cliff-pct` | 15 | Threshold for drops between neighbouring points. |
 | `--cliff-min-repeats` | 2 | Minimum valid repeats per phase and point for cliff comparisons. |
 | `--no-drift-check` | off | Do not measure the first point again at the end. |
-| `--sysmem-guard` | abort | On sysmem fallback abort (`abort`), warn (`warn`) or do nothing (`off`). |
+| `--sysmem-guard` | abort | On sysmem fallback abort (`abort`), warn (`warn`) or do nothing (`off`); default `off` with `--api openai-chat`. |
 | `--sysmem-guard-mb-s` | 1000 | Median PCIe receive during prefill that triggers the sysmem guard. |
 | `--abort-below-pct` | 20 | Abort when prefill drops below this share of the first point; `0` = off. |
 | `--vram-log` | auto | `auto`, `off` or forced `nvidia`. |
@@ -1063,7 +1146,12 @@ All sensors can be disabled for a comparison run with
 - The program uses and modifies the selected server slot. For comparable results no
   other client should use it at the same time.
 - The agent scenario simulates a single agent turn, not a multi-turn tool-call
-  history.
+  history. `--api openai-chat` builds a multi-turn history, but with plain user
+  messages as tool results, not tool calls.
+- With `--api openai-chat` the prompt length comes from the server's
+  `count_tokens` and the history contains sampled replies, so prompts differ
+  between runs; prefill is measured once per point, and decode depends on the
+  generated text (drafting, Strata's expert cache) more than with llama-server.
 
 ## Tests
 
@@ -1089,7 +1177,8 @@ All tests load `ctx-cliff.py` from the repository directory by default.
 
 Among other things the tests cover CSV recording, measurement phases and
 aggregation, GPM plausibility, prefill repeats, snapshot fallback and cleanup, the
-agent scenario and sampling options, run guards, drafting step statistics, run
+agent scenario and sampling options, the OpenAI chat mode (turn-wise prompt growth
+against a model of Strata's chat template, streaming, cache-reuse notes), run guards, drafting step statistics, run
 comparison, VRAM settling, run metadata, output fingerprints, empty instead of 0
 values and behaviour on errors and server crashes, as well as the calibration and
 probe scripts with a simulated GPU.
