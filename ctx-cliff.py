@@ -1362,6 +1362,7 @@ def print_live_row(row: Dict[str, Any], drafting_on: bool) -> None:
     print(f"{row['total_ctx']:>8} | {display_number(row.get('prompt_n')):>7} | "
           f"{display_number(row.get('prefill_tps'), 1):>8} | "
           f"{display_number(row.get('decode_tps_median'), 2):>7}{draft} | {display_number(row.get('vram_free_min_mib')):>6} | "
+          f"{display_group(row.get(k) for k in ('gpu_clock_median_mhz', 'gpu_clock_min_mhz')):>9} | "
           f"{display_number(row.get('power_avg_w')):>5} | {' | '.join(cells)} | {row['status']:>9}", flush=True)
 
 
@@ -5529,12 +5530,12 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
     draft_header_2 = f" | {'%':>6} | {'ms':>6}" if drafting_on else ""
     header_1 = (
         f"{'ctx':>8} | {'new':>7} | {'prefill':>8} | {'decode':>7}{draft_header_1} | {'free':>6} | "
-        f"{'power':>5} | {'PF PCIe':>14} | {'PF sat':>6} | {'PF BUS':>6} | {'PF GPU':>13} | "
+        f"{'clock':>9} | {'power':>5} | {'PF PCIe':>14} | {'PF sat':>6} | {'PF BUS':>6} | {'PF GPU':>13} | "
         f"{'DC PCIe':>14} | {'DC sat':>6} | {'DC BUS':>6} | {'DC GPU':>13} | {'status':>9}"
     )
     header_2 = (
         f"{'tok':>8} | {'tok':>7} | {'tok/s':>8} | {'tok/s':>7}{draft_header_2} | {'MiB':>6} | "
-        f"{'W':>5} | {'p95 R/T MiB/s':>14} | {'>90%':>6} | {'avg %':>6} | {'SM/O/T/D %':>13} | "
+        f"{'med/min':>9} | {'W':>5} | {'p95 R/T MiB/s':>14} | {'>90%':>6} | {'avg %':>6} | {'SM/O/T/D %':>13} | "
         f"{'p95 R/T MiB/s':>14} | {'>90%':>6} | {'avg %':>6} | {'SM/O/T/D %':>13} | {'':>9}"
     )
     table_width = max(len(header_1), len(header_2))
@@ -5542,6 +5543,7 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
     print("GPM PCIe = median of repeat p95s; sat = valid GPU-interval time >=90% link rate; BUS = busy time (1 s)")
     print("PF/DC windows are reconstructed estimates; CSV includes coverage, validity and fallback diagnostics")
     print("GPU = GPM SM utilization / SM occupancy / tensor utilization / DRAM bandwidth utilization")
+    print("clock = GPU SM clock median/min in MHz over the point; a low value means the GPU did not run at full boost")
     if drafting_on:
         print("draft % = accepted draft tokens (MTP, DFlash, draft model, ...); step ms = decode cost per verification step, "
               "independent of how predictable the generated text is")
