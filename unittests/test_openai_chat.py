@@ -45,7 +45,7 @@ class ChatPromptBuilderTests(unittest.TestCase):
             for target in (500, 2000, 6000, 9000):
                 ends, tokens, chars = builder.build(target)
                 self.assertLessEqual(tokens, target)
-                self.assertGreaterEqual(tokens, target - 64)
+                self.assertGreaterEqual(tokens, target - b.ChatPromptBuilder.TOLERANCE)
                 self.assertEqual(chars, ends[-1])
                 self.assertTrue(all(CONTENT[end - 1] == "\n" for end in ends))
                 prompt = render(builder.system("0" * 16), builder.turns(ends), thinking)
@@ -55,6 +55,17 @@ class ChatPromptBuilderTests(unittest.TestCase):
                 previous = prompt
                 self.assertEqual(builder.build(target), (ends, tokens, chars))  # warmup/drift: same point
                 builder.set_reply(ends, "" if thinking == "off" else f"thinking at {target}", f"answer {target}")
+
+    def test_a_turn_exceeds_the_step_by_at_most_the_fixed_tolerance_at_large_context(self):
+        builder = self.builder(content=CONTENT * 20)
+        step, previous = 8000, None
+        for target in range(step, 9 * step, step):
+            ends, tokens, _ = builder.build(target)
+            self.assertGreaterEqual(tokens, target - b.ChatPromptBuilder.TOLERANCE)
+            if previous is not None:
+                self.assertLessEqual(tokens - previous, step + b.ChatPromptBuilder.TOLERANCE)
+            previous = tokens
+            builder.set_reply(ends, "r", "a")
 
     def test_history_holds_the_first_recorded_reply_per_point(self):
         builder = self.builder()

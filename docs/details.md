@@ -242,10 +242,17 @@ sampling as above):
 The extra final point of the 8000 run (250000, only 2015 new tokens) read at
 253 tok/s: one full expert pass for a quarter of the tokens. That is no cliff;
 cliff detection only compares points with similar `prompt_n` (see
-[Detecting prefill and decode cliffs](#detecting-prefill-and-decode-cliffs)). For
-Strata use steps up to 8192 or multiples of it, and compare prefill only between
-runs with the same step. In real use every turn with a few thousand new tokens
-costs at least one full expert pass.
+[Detecting prefill and decode cliffs](#detecting-prefill-and-decode-cliffs)).
+
+A turn's new tokens are not exactly `--step`: each point ends at a line break up
+to 32 tokens below its target, so a turn gets the step plus the previous point's
+shortfall, and Strata re-reads a few tokens before its checkpoint (`new` showed
+7956–8059 with step 8000 before the shortfall was capped at 32 tokens; it grew
+with the context until then). `--step 8192` would therefore spill into a second
+chunk now and then. For Strata use `--step 8000` (or a multiple of 8192 minus a
+few hundred tokens), and compare prefill only between runs with the same step. In
+real use every turn with a few thousand new tokens costs at least one full expert
+pass.
 
 **Strata specifics.** With thinking enabled and a small `--n-predict` Strata logs
 "the reply reached max tokens while still thinking, so it has no answer"; that is

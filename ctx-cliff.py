@@ -2222,6 +2222,11 @@ class ChatPromptBuilder:
     request (cold mode, warmup).
     """
     MAX_COUNT_CALLS = 12
+    # A point may fall short of its target by this many tokens. Fixed, not relative
+    # to the context: a turn's new tokens are the step plus the previous point's
+    # shortfall, and Strata needs a second prefill chunk (one more full expert pass)
+    # once a turn exceeds 8192 tokens.
+    TOLERANCE = 32
 
     def __init__(self, content: str, run: str, task: str, thinking: str, count: Any,
                  chars_per_token: float, max_prompt_ctx: Optional[int] = None, step_task: str = "") -> None:
@@ -2310,7 +2315,7 @@ class ChatPromptBuilder:
         if base >= ctx:
             raise PromptBuildError(f"target {ctx} leaves no room for another tool result "
                                    f"(the conversation with an empty one has {base} tokens)")
-        tolerance = max(32, ctx // 1000)
+        tolerance = self.TOLERANCE
         low, low_tokens, high = start, base, None
         guess = start + (ctx - base) * self.density
         for _ in range(self.MAX_COUNT_CALLS):
