@@ -78,12 +78,14 @@ script sends them with every request and gives each repeat its own seed.
 
 **Chat server without `/completion`, for example Strata.** The conversation grows
 by tool-result turns like an agent loop; sampling keeps the model from copying
-its earlier replies:
+its earlier replies. The values are the thinking-mode settings from the
+[Qwen3.8-Flash-Next model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
+the model Strata runs:
 
 ```bash
 python ctx-cliff.py --file data/django.py --api openai-chat --scenario agent \
   --start 8000 --end 128000 --step 8000 --repeat 2 --n-predict 256 \
-  --temperature 0.6 --top-p 0.95 --top-k 20 --seed 1 --csv
+  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --seed 1 --csv
 ```
 
 **Compare runs** (reference first; works across builds, settings and models):
@@ -114,7 +116,7 @@ One row per context point:
 | `draft` | Accepted / proposed draft tokens; only shown when drafting is active. |
 | `step` | Median cost of one decode step in ms. With drafting this reflects the context cost regardless of how predictable the generated text is. |
 | `free` | Lowest free VRAM seen during the point. |
-| `clock` | GPU SM clock median/min in MHz; a low value means the GPU did not run at full boost. |
+| `clock` | GPU SM clock median/min in MHz during prefill and decode; a low value means the GPU did not run at full boost. |
 | `PF/DC …` | Prefill/decode PCIe traffic, link saturation and GPU engine utilization. |
 | `status` | `OK`, or for example `2/3 OK` if repeats were invalid. |
 
@@ -133,6 +135,8 @@ check (first point measured again), the cliff analysis and, with
 | `--scenario` | file | `file`: continue the input file; `agent`: chat conversation with growing file excerpt and fixed task. |
 | `--api` | llama | `llama`: llama-server's `/completion`; `openai-chat`: `/v1/chat/completions` (Strata), needs `--scenario agent`. |
 | `--deterministic` | off | Greedy decoding (`temperature=0`, `top_k=1`). |
+| `--min-decode-tokens N` | – | Replies that end by themselves after at least N tokens still count for decode (servers without `--ignore-eos`, e.g. Strata). |
+| `--save-outputs` | off | Keep the full generated text of every repeat in `.outputs.jsonl`. |
 | `--temperature`, `--top-p`, `--top-k`, `--min-p`, … | server | Sampling settings sent with every request; `--sampler KEY=VALUE` for any other field. |
 | `--nonce TEXT` | random | Fixed run marker, so A/B runs use identical prompts. |
 | `--reference CSV` / `--compare REF RUN …` | – | Compare with earlier runs. |

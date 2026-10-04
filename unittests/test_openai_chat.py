@@ -1,5 +1,6 @@
 """--api openai-chat: turn-wise growing conversation, chat requests, Strata-style cache reuse."""
 import contextlib
+import csv
 import io
 import itertools
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -65,6 +67,23 @@ class ChatPromptBuilderTests(unittest.TestCase):
             if previous is not None:
                 self.assertLessEqual(tokens - previous, step + b.ChatPromptBuilder.TOLERANCE)
             previous = tokens
+            builder.set_reply(ends, "r", "a")
+
+    def test_search_reaches_the_tolerance_when_token_density_shifts(self):
+        # Dense stretches (8 chars/token) alternate with sparse ones (2 chars/token), so
+        # a proportional estimate keeps missing; the bracket search must still converge.
+        def uneven(system, turns):
+            text = "".join(t["content"] for t in turns)
+            return 100 + sum(len(text[i:i + 4000]) // (8 if (i // 4000) % 2 else 2)
+                             for i in range(0, len(text), 4000))
+        calls = []
+        builder = b.ChatPromptBuilder(CONTENT * 20, "run", "TASK", "auto",
+                                      lambda s, t: calls.append(1) or uneven(s, t), 3.0)
+        for target in range(8000, 72000, 8000):
+            calls.clear()
+            ends, tokens, _ = builder.build(target)
+            self.assertLessEqual(target - tokens, b.ChatPromptBuilder.TOLERANCE, target)
+            self.assertLessEqual(len(calls), b.ChatPromptBuilder.MAX_COUNT_CALLS + 1)
             builder.set_reply(ends, "r", "a")
 
     def test_history_holds_the_first_recorded_reply_per_point(self):
@@ -176,8 +195,44 @@ class ChatRequestTests(unittest.TestCase):
         self.assertEqual(b.chat_thinking_fields("auto", "openai"), {})
 
 
+class ClockWindowTests(unittest.TestCase):
+    def test_clock_statistics_cover_prefill_and_decode_only(self):
+        """The idle start of a request (server-side prompt preparation) must not set the clock minimum."""
+        class Monitor:
+            def __init__(self):
+                self.request_start = None
+
+            def set_label(self, *args):
+                pass
+
+            def register_pcie_phase_window(self, *args):
+                pass
+
+            def summarize(self, start, end):
+                if self.request_start is None:
+                    self.request_start = start
+                idle = start <= self.request_start  # a window that includes the idle start
+                return {**b.empty_vram(), "gpu_clock_min_mhz": 300.0 if idle else 2850.0,
+                        "gpu_clock_median_mhz": 2880.0, "gpu_clock_max_mhz": 2900.0}
+
+        args = Mock(cache_mode="incremental", n_predict=8, deterministic=False, slot_id=0, ignore_eos=False,
+                    stream=False, min_decode_tokens=None, gpm_restart="off", sysmem_guard="off",
+                    temperature=None, top_p=None, top_k=None, min_p=None, typical_p=None, repeat_penalty=None,
+                    repeat_last_n=None, presence_penalty=None, frequency_penalty=None, sampler={}, seed=None)
+        runner = b.BenchmarkRunner(args, "http://x", Mock(), Mock(), Mock(), Monitor(), None, None)
+        response = {"content": "x", "timings": {"prompt_n": 10, "prompt_ms": 100.0, "predicted_n": 8,
+                                                "predicted_ms": 100.0}}
+
+        def slow_completion(*a, **k):  # 0.5 s idle before the engine's 0.2 s of work
+            time.sleep(0.7)
+            return response
+        with patch.object(b, "completion", side_effect=slow_completion):
+            sample = runner._take_sample([1, 2, 3], 1000, 0)
+        self.assertEqual(sample["gpu_clock_min_mhz"], 2850.0)
+
+
 class ChatRunTests(unittest.TestCase):
-    def run_main(self, *extra, reuse=True, same_reply=False):
+    def run_main(self, *extra, reuse=True, same_reply=False, predicted=None):
         seen = []
         state = {"held": set()}  # (system, rendered prompt) the fake server has checkpoints for
 
@@ -192,7 +247,7 @@ class ChatRunTests(unittest.TestCase):
             return {"content": "x" if same_reply else f"x{len(seen)}", "reasoning": f"r{len(seen)}", "answer": f"a{len(seen)}",
                     "stop_type": "length", "truncated": False, "prompt_tokens": tokens,
                     "timings": {"cache_n": tokens - prompt_n, "prompt_n": prompt_n, "prompt_ms": prompt_ms,
-                                "predicted_n": n_predict, "predicted_ms": 20.0}}
+                                "predicted_n": predicted or n_predict, "predicted_ms": 20.0}}
 
         def count_text(prompt):
             return len(re.findall(r"<\|\w+\|>|\s*[^\s<]+|\s+|<", prompt))
@@ -219,6 +274,11 @@ class ChatRunTests(unittest.TestCase):
                  contextlib.redirect_stdout(err), contextlib.redirect_stderr(err):
                 b.main()
             meta = json.loads(csv_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+            outputs = csv_path.with_suffix(".outputs.jsonl")
+            self.outputs = ([json.loads(line) for line in outputs.read_text(encoding="utf-8").splitlines()]
+                            if outputs.exists() else None)
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                self.results = list(csv.DictReader(f))
         return seen, meta, err.getvalue()
 
     def test_incremental_reuses_the_previous_point_and_measures_prefill_once(self):
@@ -258,10 +318,26 @@ class ChatRunTests(unittest.TestCase):
         self.assertTrue(all(cached == 0 for _, _, cached, *_ in seen))
         self.assertEqual(meta["measurement"]["prefill_mode"], "cold")
 
+    def test_min_decode_tokens_keeps_early_replies_and_save_outputs_writes_them(self):
+        _, _, err = self.run_main("--repeat", "2", "--warmup", "0", "--no-drift-check", predicted=6)
+        self.assertEqual([r["status"] for r in self.results], ["0/2 OK"] * 3)  # default: STOP@6 excluded
+        self.assertIsNone(self.outputs)
+        _, _, err = self.run_main("--repeat", "2", "--warmup", "0", "--no-drift-check",
+                                  "--min-decode-tokens", "5", "--save-outputs", predicted=6)
+        self.assertEqual([r["status"] for r in self.results], ["OK"] * 3)
+        self.assertTrue(all(r["decode_tps_median"] for r in self.results))
+        self.assertNotIn("decode sample excluded", err)
+        self.assertEqual(len(self.outputs), 6)
+        first = self.outputs[0]
+        self.assertEqual((first["target_ctx"], first["repeat"], first["status"], first["predicted_n"]),
+                         (1000, 1, "EOS@6", 6))
+        self.assertEqual((first["reasoning"], first["answer"]), ("r1", "a1"))
+
     def test_invalid_combinations_are_rejected(self):
         for arguments in (["--api", "openai-chat"], ["--api", "openai-chat", "--scenario", "agent", "--ignore-eos"],
                           ["--scenario", "agent", "--agent-step-task", "x"],
-                          ["--api", "openai-chat", "--scenario", "agent", "--agent-step-task", " "]):
+                          ["--api", "openai-chat", "--scenario", "agent", "--agent-step-task", " "],
+                          ["--min-decode-tokens", "65"], ["--min-decode-tokens", "0"], ["--save-outputs"]):
             argv = ["ctx-cliff.py", "--file", "input.txt", *arguments]
             with patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()), \
                  self.assertRaises(SystemExit) as raised:

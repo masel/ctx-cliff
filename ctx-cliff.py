@@ -1170,7 +1170,7 @@ def summarize_outputs(samples: Any) -> Dict[str, Any]:
 def aggregate_point(samples: Any, ctx: int, total_ctx: int, target_chars: int, args: Any) -> Dict[str, Any]:
     if not samples:
         raise ValueError("cannot aggregate an empty benchmark point")
-    valid = [s for s in samples if s["status"] == "OK"
+    valid = [s for s in samples if decode_status_valid(s["status"])
              and (finite_number(s["decode_tps"]) or 0) > 0]
     decode = [s["decode_tps"] for s in valid]
     per_step = [v for s in valid if (v := finite_number(s.get("tokens_per_step"))) is not None]
@@ -1699,11 +1699,15 @@ class CsvRecording:
         ]
         # Run metadata accompanies the result CSV (same stem, .meta.json).
         self.meta_path: Optional[str] = trace_path(None, ".meta.json")
+        # --save-outputs: full generated text of every measured repeat, one JSON object per line.
+        self.outputs_path: Optional[str] = (trace_path(None, ".outputs.jsonl")
+                                            if getattr(args, "save_outputs", False) else None)
         # Early creation must not truncate the benchmark input or another output.
         protected = [args.file]
         if args.server_log and args.server_log != "-":
             protected.append(args.server_log)
-        validate_distinct_paths([*protected, *(path for _, path, _ in specs), self.meta_path])
+        validate_distinct_paths([*protected, *(path for _, path, _ in specs), self.meta_path,
+                                 self.outputs_path])
         self.specs = specs
 
     def __enter__(self) -> "CsvRecording":
@@ -1720,7 +1724,12 @@ class CsvRecording:
                 writer.writeheader()
                 f.flush()
                 print(f"CSV recording: {path}", file=sys.stderr)
-            if any(name not in {"results", "samples"} for name in self.files):
+            if self.outputs_path is not None:
+                self.files["outputs"] = open(self.outputs_path, "w", encoding="utf-8")
+                self.paths["outputs"] = self.outputs_path
+                self.counts["outputs"] = 0
+                print(f"Output recording: {self.outputs_path}", file=sys.stderr)
+            if any(name not in {"results", "samples", "outputs"} for name in self.files):
                 self.thread = threading.Thread(target=self._run, name="csv-recording", daemon=True)
                 self.thread.start()
             return self
@@ -1802,6 +1811,13 @@ class CsvRecording:
             writer.writerow({key: row.get(key) for key in writer.fieldnames})
             self.files["samples"].flush()
             self.counts["samples"] += 1
+
+    def write_output(self, record: Dict[str, Any]) -> None:
+        self.check()
+        if "outputs" in self.files:
+            self.files["outputs"].write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.files["outputs"].flush()
+            self.counts["outputs"] += 1
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if self.closed:
@@ -2221,7 +2237,7 @@ class ChatPromptBuilder:
     ends as the prompt; the request id in the system message is chosen per
     request (cold mode, warmup).
     """
-    MAX_COUNT_CALLS = 12
+    MAX_COUNT_CALLS = 16
     # A point may fall short of its target by this many tokens. Fixed, not relative
     # to the context: a turn's new tokens are the step plus the previous point's
     # shortfall, and Strata needs a second prefill chunk (one more full expert pass)
@@ -2316,7 +2332,7 @@ class ChatPromptBuilder:
             raise PromptBuildError(f"target {ctx} leaves no room for another tool result "
                                    f"(the conversation with an empty one has {base} tokens)")
         tolerance = self.TOLERANCE
-        low, low_tokens, high = start, base, None
+        low, low_tokens, high, high_tokens = start, base, None, 0
         guess = start + (ctx - base) * self.density
         for _ in range(self.MAX_COUNT_CALLS):
             end = self._line_end(guess, low, high)
@@ -2328,9 +2344,19 @@ class ChatPromptBuilder:
                 if ctx - tokens <= tolerance or end == len(self.content):
                     break
             else:
-                high = end
-            density = (end - start) / max(1, tokens - base)
-            guess = start + (ctx - base) * density * (0.995 if tokens > ctx else 1.0)
+                high, high_tokens = end, tokens
+            if high is None:
+                density = (end - start) / max(1, tokens - base)
+                guess = start + (ctx - base) * density
+            else:
+                # Bracketed: interpolate between both ends, but halve the bracket when
+                # the estimate hugs one end; a guess clamped to just above `low` advances
+                # only one line per count (a 360k point once ended 322 tokens short).
+                aim = ctx - tolerance // 2
+                guess = low + (high - low) * (aim - low_tokens) / max(1, high_tokens - low_tokens)
+                margin = (high - low) / 8
+                if not low + margin < guess < high - margin:
+                    guess = (low + high) / 2
         if low == start:
             raise PromptBuildError(f"no line of the input fits the {ctx}-token target")
         if ctx - low_tokens > max(tolerance, ctx // 50) and low < len(self.content):
@@ -2696,14 +2722,23 @@ def rate_from_timing(t: Dict[str, Any], count_key: str, ms_key: str, rate_key: s
     return 0.0
 
 
-def sample_status(predicted_n: int, n_predict: int, truncated: bool) -> str:
+def sample_status(predicted_n: int, n_predict: int, truncated: bool,
+                  min_decode_tokens: Optional[int] = None) -> str:
+    """OK, or EOS@n: ended early after at least --min-decode-tokens (still a valid
+    decode sample), STOP@n: ended earlier (excluded), EMPTY or TRUNC."""
     if truncated:
         return "TRUNC"
     if predicted_n <= 0:
         return "EMPTY"
     if predicted_n < n_predict:
+        if min_decode_tokens and predicted_n >= min_decode_tokens:
+            return f"EOS@{predicted_n}"
         return f"STOP@{predicted_n}"
     return "OK"
+
+
+def decode_status_valid(status: Any) -> bool:
+    return status == "OK" or str(status).startswith("EOS@")
 
 
 def largest_rate_drop(
@@ -4323,6 +4358,13 @@ class BenchmarkRunner:
                     "prefill_mode": prefill_mode(self.args),
                     "repeat": repeat + 1, "validation_error": validation_error,
                 })
+                if getattr(self.args, "save_outputs", False):
+                    self.recording.write_output({
+                        "target_ctx": ctx, "total_ctx": total_ctx, "repeat": repeat + 1,
+                        "status": sample["status"], "stop_type": sample.get("stop_type"),
+                        "predicted_n": sample["predicted_n"], "output_sha256": sample.get("output_sha256"),
+                        **getattr(self, "last_output", {}),
+                    })
             if guard_error is not None:
                 raise guard_error
             if validation_error:
@@ -4366,7 +4408,8 @@ class BenchmarkRunner:
             self.chat_copy_noted = True
             self.note(f"NOTE target={ctx}: the reply is identical to the previous point's (output_sha256 "
                       f"{digest}); the model copies its earlier reply, which inflates draft acceptance and "
-                      "decode t/s. Use sampling (e.g. --temperature 0.6 --top-p 0.95 --top-k 20 --seed 1) "
+                      "decode t/s. Use the model card's sampling settings (Qwen3.8-Flash-Next thinking: "
+                      "--temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --seed 1) "
                       "or another --agent-step-task")
         self.previous_output_sha256 = digest
 
@@ -4514,6 +4557,14 @@ class BenchmarkRunner:
 
         windows, quality = reconstruct_phases(monitor_start, monitor_end, prompt_ms, predicted_ms,
                                               resp.get("_first_token_mono"))
+        if self.vram_monitor is not None and windows[-1][2] > windows[0][1]:
+            # Clocks over prefill + decode only. Before that a server may prepare the
+            # prompt on the CPU (Strata: ~2 s at 500k) while the idle GPU clocks down
+            # to a few hundred MHz, which is no throttling.
+            clocks = self.vram_monitor.summarize(windows[0][1], windows[-1][2])
+            if clocks.get("gpu_clock_median_mhz") is not None:
+                vram.update({key: clocks.get(key) for key in
+                             ("gpu_clock_min_mhz", "gpu_clock_median_mhz", "gpu_clock_max_mhz")})
         pcie_phase, gpm_phase = {}, {}
         if self.gpm_monitor is not None and hasattr(self.gpm_monitor, "wait_for_lagged"):
             self.gpm_monitor.wait_for_lagged(monitor_end)
@@ -4537,13 +4588,17 @@ class BenchmarkRunner:
         prefill_tps = rate_from_timing(t, "prompt_n", "prompt_ms", "prompt_per_second")
         decode_tps = rate_from_timing(t, "predicted_n", "predicted_ms", "predicted_per_second")
         truncated = bool(resp.get("truncated", False))
-        status = sample_status(predicted_n, self.args.n_predict, truncated)
+        status = sample_status(predicted_n, self.args.n_predict, truncated,
+                               getattr(self.args, "min_decode_tokens", None))
 
-        if status != "OK":
+        if not decode_status_valid(status):
             self.note(f"NOTE target={target_ctx} repeat={repeat_idx + 1}: {status}; "
                       f"decode sample excluded from median "
                       f"(stop_type={resp.get('stop_type')!r}, truncated={truncated})")
 
+        # Full generated text for --save-outputs (written by measure_point).
+        self.last_output = ({"reasoning": resp.get("reasoning") or "", "answer": resp.get("answer") or ""}
+                            if self.chat else {"content": resp.get("content") or ""})
         output = analyze_output(resp.get("content"))
         loop_pct = finite_number(output["output_loop_pct"])
         if (phase == "measure" and loop_pct is not None and loop_pct >= OUTPUT_LOOP_WARN_PCT
@@ -4603,7 +4658,8 @@ def step_values_from_samples(path: str) -> Dict[int, Dict[str, float]]:
         for row in csv.DictReader(f):
             ctx = _int_or_none(row.get("target_ctx"))
             predicted_n, predicted_ms = _int_or_none(row.get("predicted_n")), finite_number(row.get("predicted_ms"))
-            if ctx is None or row.get("status") != "OK" or predicted_n is None or predicted_ms is None:
+            if (ctx is None or not decode_status_valid(row.get("status"))
+                    or predicted_n is None or predicted_ms is None):
                 continue
             stats = decode_step_stats(predicted_n, predicted_ms, _int_or_none(row.get("draft_acc")) or 0)
             if stats["ms_per_step"] is not None:
@@ -5019,7 +5075,8 @@ notes:
   * cache_n is logged explicitly instead of inferring cache behaviour from tok/s
   * cliff detection separately checks relative drops between adjacent median
     prefill and decode rates
-  * STOP/EMPTY samples are shown but excluded from decode medians and cliff detection
+  * STOP/EMPTY samples are shown but excluded from decode medians and cliff detection;
+    with --min-decode-tokens N a reply ending after >= N tokens counts (status EOS@n)
   * --vram-log auto starts one long-lived nvidia-smi sampler when available;
     it also records clocks, P-state, power and temperature when supported
   * PCIe RX/TX uses direct NVML polling (no dmon fallback). Install NVIDIA's
@@ -5168,6 +5225,12 @@ notes:
         "--ignore-eos",
         action="store_true",
         help="ask llama-server to ignore EOS so samples are more likely to reach n_predict",
+    )
+    g.add_argument(
+        "--min-decode-tokens", type=int, default=None, metavar="N",
+        help=("a reply that ends by itself after at least N of --n-predict tokens still counts as a "
+              "decode sample (status EOS@n instead of STOP@n); for servers without --ignore-eos, "
+              "e.g. Strata (default: only complete replies count)"),
     )
     for key, kind in SAMPLER_OPTIONS.items():
         names = ["--" + key.replace("_", "-")] + (["--" + key] if "_" in key else [])
@@ -5398,6 +5461,11 @@ notes:
         help="stream CSV results; omit PATH for a timestamped file in --csv-dir",
     )
     g.add_argument(
+        "--save-outputs", action="store_true",
+        help=("also write the full generated text (reasoning and answer) of every measured repeat to "
+              "<csv stem>.outputs.jsonl; requires --csv"),
+    )
+    g.add_argument(
         "--csv-dir", default="outputs",
         help="directory for automatically named CSVs (default: %(default)s); explicit PATH takes precedence",
     )
@@ -5460,6 +5528,10 @@ notes:
         ap.error("--api openai-chat requires --scenario agent (a chat server has no raw text completion)")
     if args.api == "openai-chat" and args.ignore_eos:
         ap.error("--ignore-eos is not available with --api openai-chat")
+    if args.min_decode_tokens is not None and not 0 < args.min_decode_tokens <= args.n_predict:
+        ap.error("--min-decode-tokens must be between 1 and --n-predict")
+    if args.save_outputs and args.csv is None:
+        ap.error("--save-outputs requires --csv")
     if args.sysmem_guard is None:
         args.sysmem_guard = "off" if args.api == "openai-chat" else "abort"
     args.sampler = dict(args.sampler or [])
@@ -5979,7 +6051,7 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
     print("GPM PCIe = median of repeat p95s; sat = valid GPU-interval time >=90% link rate; BUS = busy time (1 s)")
     print("PF/DC windows are reconstructed estimates; CSV includes coverage, validity and fallback diagnostics")
     print("GPU = GPM SM utilization / SM occupancy / tensor utilization / DRAM bandwidth utilization")
-    print("clock = GPU SM clock median/min in MHz over the point; a low value means the GPU did not run at full boost")
+    print("clock = GPU SM clock median/min in MHz during prefill/decode; a low value means the GPU did not run at full boost")
     if drafting_on:
         print("draft % = accepted draft tokens (MTP, DFlash, draft model, ...); step ms = decode cost per verification step, "
               "independent of how predictable the generated text is")

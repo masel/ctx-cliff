@@ -164,7 +164,7 @@ the template default. Rendering, prefix and suffix tokens are stored in
 ### Chat servers without `/completion` (`--api openai-chat`)
 
 ```bash
-python ctx-cliff.py --file data/django.py --api openai-chat --scenario agent --start 8000 --end 128000 --step 8000 --repeat 2 --n-predict 256 --temperature 0.6 --top-p 0.95 --top-k 20 --seed 1 --csv
+python ctx-cliff.py --file data/django.py --api openai-chat --scenario agent --start 8000 --end 128000 --step 8000 --repeat 2 --n-predict 256 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --seed 1 --csv
 ```
 
 Some servers only speak the OpenAI chat API, for example
@@ -208,9 +208,18 @@ in such a run, and decode t/s with them: the copy speed, not a context effect.
 A fixed step wording is not enough with greedy decoding either, because each reply
 starts by quoting it. `--agent-step-task none` restores the plain task, for
 example to measure rewriting on purpose; your own text may contain `{where}`.
-Use sampling settings (the example uses Qwen's recommendations): sampled replies
-differ between points. If a reply is nevertheless identical to the previous
-point's, a note says so once.
+Use sampling settings: sampled replies differ between points. If a reply is
+nevertheless identical to the previous point's, a note says so once.
+
+The example uses the thinking-mode settings from the
+[Qwen3.8-Flash-Next model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
+the model Strata runs: `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`.
+The card's `presence_penalty=0.0` and `repetition_penalty=1.0` are neutral; Strata
+ignores neutral values, so they can be left out. For `--agent-thinking off` the
+card suggests `--temperature 0.7 --top-p 0.80 --top-k 20 --min-p 0.0
+--presence-penalty 1.5`. That penalty is active, and Strata documents requests
+with penalties as 1–11 % slower (its drafts are guessed without penalties), so
+compare such runs only with each other.
 
 **No slots.** A request id in the system message stands in for a slot erase: the
 warmup, the drift check and every request in `cold` mode use an id the server has
@@ -232,7 +241,7 @@ test run). The usable prompt length is the server context minus
 VRAM over PCIe once per chunk; during prefill the PCIe receive rate sits at the
 link limit. The time for a new turn therefore depends mainly on the number of
 chunks, not on its tokens. Measured with IQ3_S on a 16 GB card (`--repeat 2`,
-sampling as above):
+`--temperature 0.6 --top-p 0.95 --top-k 20`):
 
 | `--step` | chunks per turn | prefill at the start | prefill at ~250k |
 |---|---:|---:|---:|
@@ -254,13 +263,21 @@ few hundred tokens), and compare prefill only between runs with the same step. I
 real use every turn with a few thousand new tokens costs at least one full expert
 pass.
 
+**Per-request preparation.** Before its engine starts, Strata renders and
+tokenizes the whole conversation in Python, on every request, cached or not. In a
+500k run this took 0.05 s at 8k, 0.8 s at 200k and 2.3 s at 520k (wall time minus
+`prompt_ms` and `predicted_ms` in `.samples.csv`). It is not part of the prefill
+and decode rates, but an agent waits for it every turn.
+
 **Strata specifics.** With thinking enabled and a small `--n-predict` Strata logs
 "the reply reached max tokens while still thinking, so it has no answer"; that is
 expected, thinking tokens are decoded like any other. Its adaptive expert cache
 (hit rate in the server log) makes decode vary more between repeats than with
 llama-server, so prefer two or more repeats. `--ignore-eos` is not available;
 replies that end before `--n-predict` are `STOP` samples and excluded from the
-decode median.
+decode median unless `--min-decode-tokens` lets them count (see
+[Validity of decode measurements](#validity-of-decode-measurements)); at long
+context this is needed. `--save-outputs` keeps the replies for inspection.
 
 ### Sampling settings
 
@@ -463,7 +480,7 @@ then combined per context point. Not all values are means.
 | `draft` | `100 × sum of accepted draft tokens / sum of proposed draft tokens` over all repeats; `n/a` without drafts at the point. Covers every kind of drafting llama-server reports in `timings.draft_n`/`draft_n_accepted` (MTP, DFlash, draft model, n-gram). The column appears when drafting was detected during the warmup or at the first point. CSV: `draft_n`, `draft_acc`, `draft_acc_pct`. |
 | `step ms` | Median cost of one verification step, `predicted_ms / (predicted_n − draft_n_accepted)`, over valid decode repeats; only with active drafting. Independent of how predictable the generated text is (see [Decode with drafting](#decode-with-drafting)). |
 | `free` | **Lowest free VRAM** during all requests of the point, prefill and decode together; MiB. |
-| `clock` | GPU SM clock median/min over the point in MHz (CSV: `gpu_clock_median_mhz`, `gpu_clock_min_mhz`); a low value means the GPU did not run at full boost. |
+| `clock` | GPU SM clock median/min in MHz over the prefill and decode windows of the point (CSV: `gpu_clock_median_mhz`, `gpu_clock_min_mhz`); a low value means the GPU did not run at full boost. Time before the server starts processing is left out: Strata, for example, renders and tokenizes the whole conversation on the CPU first (about 2 s at 500k), and the idle GPU clocks down to a few hundred MHz meanwhile. The raw trace (`.vram.csv`) keeps all samples. |
 | `power` | Mean of all valid power samples during the requests, weighted by the number of valid samples; W. |
 | `PF/DC PCIe` | GPM receive/transmit in MiB/s: first p95 per repeat and phase, then the median of these p95 values. |
 | `PF/DC sat` | Share of valid GPU interval time with **at least 90 %** of the theoretical PCIe link rate. |
@@ -508,13 +525,14 @@ console columns are not replaced by differently defined legacy PCIe values.
 
 ### Validity of decode measurements
 
-A repeat counts for decode only if its status is `OK` and the rate is positive.
-The individual statuses are listed in `sample_statuses`:
+A repeat counts for decode only if its status is `OK` (or `EOS@N`) and the rate is
+positive. The individual statuses are listed in `sample_statuses`:
 
 | Status | Meaning |
 |---|---|
 | `OK` | At least the requested number of decode tokens, no truncation reported. |
-| `STOP@N` | Stopped early after N tokens. |
+| `EOS@N` | Ended by itself after N tokens, at least `--min-decode-tokens`; counts as valid. |
+| `STOP@N` | Stopped early after N tokens (fewer than `--min-decode-tokens`, or that option not set). |
 | `EMPTY` | No tokens generated. |
 | `TRUNC` | The server reports truncation. |
 
@@ -526,6 +544,14 @@ and the point gives no valid cliff comparison. The same applies to `prefill_tps`
 `draft_acc_pct` without draft tokens. A 0 in these columns is therefore always a
 real measurement. `--ignore-eos` raises the chance of complete decode windows but
 does not guarantee it.
+
+Servers without `--ignore-eos` (Strata) end replies when the model is done. In a
+500k Strata run the replies got shorter with growing context (median 256 tokens up
+to 128k, about 175 above 450k), so from about 330k every repeat was `STOP@…` and
+decode stayed empty. `--min-decode-tokens N` lets such replies count when they ran
+at least N tokens (for example 128 with `--n-predict 256`). Their rate covers
+fewer tokens, so it is somewhat noisier; the token counts are in `predicted_n`.
+Without the option nothing changes.
 
 ### Decode with drafting
 
@@ -828,6 +854,7 @@ flushed raw data are kept.
 | `ctx-cliff-….csv` | One aggregated result row per fully completed context point. |
 | `ctx-cliff-….samples.csv` | One row per measured repeat, including invalid ones, with validation error and output fingerprint. |
 | `ctx-cliff-….meta.json` | Run metadata, see below. |
+| `ctx-cliff-….outputs.jsonl` | Only with `--save-outputs`: full generated text per measured repeat, see [Generated output](#generated-output). |
 | `ctx-cliff-….vram.csv` | Raw NVIDIA memory, clock, power and utilization samples. |
 | `ctx-cliff-….pcie.csv` | Raw legacy NVML PCIe and BUS samples. |
 | `ctx-cliff-….gpm.csv` | Raw GPM intervals with engine and PCIe values. |
@@ -902,6 +929,13 @@ generated text per repeat in `.samples.csv`:
   example with `--ignore-eos`; such loops can also distort draft acceptance and
   thus the decode rate. Without drafting they have practically no influence on the
   decode rate.
+
+`--save-outputs` (needs `--csv`) additionally writes the full generated text of
+every measured repeat to `<stem>.outputs.jsonl`, one JSON object per line with
+`target_ctx`, `total_ctx`, `repeat`, `status`, `stop_type`, `predicted_n`,
+`output_sha256` and the text: `reasoning` and `answer` with `--api openai-chat`,
+otherwise `content`. Warmup and the drift check are not written. Useful to see why
+replies end early or repeat; a 500k Strata run produces a few hundred KB.
 
 Notes produced during the sweep (early EOS `STOP@…`, `TRUNC`, loops, differing
 outputs despite `--deterministic`, GPM restarts) do not appear between the table
@@ -1113,6 +1147,8 @@ python ctx-cliff.py --help
 | `--deterministic` | off | Sets `temperature=0` and `top_k=1`; does not guarantee identical timings. |
 | `--nonce TEXT` | random | Fixed run marker at the start of the prompt for comparable A/B runs (1–64 printable characters). |
 | `--ignore-eos` | off | Requests continuation despite EOS. |
+| `--min-decode-tokens N` | – | A reply ending by itself after at least N tokens still counts for decode (`EOS@N`). |
+| `--save-outputs` | off | Write the full generated text per measured repeat to `.outputs.jsonl` (needs `--csv`). |
 | `--scenario` | file | `file`: continue the file; `agent`: chat conversation with growing file excerpt and fixed task. |
 | `--agent-task TEXT` | built-in | Fixed task at the end of the agent prompt. |
 | `--agent-thinking` | auto | `enable_thinking` of the chat template: `on`, `off` or template default. |
