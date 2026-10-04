@@ -227,6 +227,26 @@ Strata streams experts over PCIe by design (about 7 GB/s during prefill in a
 test run). The usable prompt length is the server context minus
 `--n-predict` minus 9 tokens (Strata keeps 8 tokens of slack).
 
+**Strata prefill depends on `--step`.** Strata reads a prompt in chunks of up to
+8192 tokens (`--prefill auto`) and streams every expert that is not resident in
+VRAM over PCIe once per chunk; during prefill the PCIe receive rate sits at the
+link limit. The time for a new turn therefore depends mainly on the number of
+chunks, not on its tokens. Measured with IQ3_S on a 16 GB card (`--repeat 2`,
+sampling as above):
+
+| `--step` | chunks per turn | prefill at the start | prefill at ~250k |
+|---|---:|---:|---:|
+| 8000 | 1 | 1026 tok/s (8k) | 763 tok/s (248k) |
+| 10000 | 2 | 683 tok/s (10k) | 533 tok/s (250k) |
+
+The extra final point of the 8000 run (250000, only 2015 new tokens) read at
+253 tok/s: one full expert pass for a quarter of the tokens. That is no cliff;
+cliff detection only compares points with similar `prompt_n` (see
+[Detecting prefill and decode cliffs](#detecting-prefill-and-decode-cliffs)). For
+Strata use steps up to 8192 or multiples of it, and compare prefill only between
+runs with the same step. In real use every turn with a few thousand new tokens
+costs at least one full expert pass.
+
 **Strata specifics.** With thinking enabled and a small `--n-predict` Strata logs
 "the reply reached max tokens while still thinking, so it has no answer"; that is
 expected, thinking tokens are decoded like any other. Its adaptive expert cache
