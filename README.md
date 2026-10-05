@@ -116,7 +116,7 @@ One row per context point:
 | `draft` | Accepted / proposed draft tokens; only shown when drafting is active. |
 | `step` | Median cost of one decode step in ms. With drafting this reflects the context cost regardless of how predictable the generated text is. |
 | `free` | Lowest free VRAM seen during the point. |
-| `clock` | GPU SM clock median/min in MHz during prefill and decode; a low value means the GPU did not run at full boost. |
+| `clock` | GPU SM clock median/min in MHz during prefill and decode (without the first second, when the GPU may still clock up from idle); a low value means the GPU did not run at full boost. |
 | `PF/DC …` | Prefill/decode PCIe traffic, link saturation and GPU engine utilization. |
 | `status` | `OK`, or for example `2/3 OK` if repeats were invalid. |
 

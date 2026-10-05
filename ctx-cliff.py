@@ -1090,6 +1090,10 @@ def prefill_mode(args: Any) -> str:
     return "snapshot" if getattr(args, "prefill_repeat_enabled", True) else "first_repeat_only"
 
 
+# Clock statistics skip this much of the start of prefill: the GPU may still be
+# clocking up from idle (observed: up to 1.2 s after a long idle gap with Strata).
+CLOCK_RAMP_S = 1.0
+
 OUTPUT_EXCERPT_CHARS = 200
 OUTPUT_LOOP_WINDOW_CHARS = 1000
 OUTPUT_LOOP_WARN_PCT = 50.0
@@ -4558,10 +4562,14 @@ class BenchmarkRunner:
         windows, quality = reconstruct_phases(monitor_start, monitor_end, prompt_ms, predicted_ms,
                                               resp.get("_first_token_mono"))
         if self.vram_monitor is not None and windows[-1][2] > windows[0][1]:
-            # Clocks over prefill + decode only. Before that a server may prepare the
-            # prompt on the CPU (Strata: ~2 s at 500k) while the idle GPU clocks down
-            # to a few hundred MHz, which is no throttling.
-            clocks = self.vram_monitor.summarize(windows[0][1], windows[-1][2])
+            # Clocks over prefill + decode only, without their first second. Before
+            # that a server may prepare the prompt on the CPU (Strata: ~2 s at 500k)
+            # while the idle GPU clocks down to a few hundred MHz; after an idle gap
+            # it then needs up to ~1.2 s to clock up again. Neither is throttling.
+            clock_start = windows[0][1] + CLOCK_RAMP_S
+            if clock_start >= windows[-1][2]:
+                clock_start = windows[0][1]  # short request: keep the whole window
+            clocks = self.vram_monitor.summarize(clock_start, windows[-1][2])
             if clocks.get("gpu_clock_median_mhz") is not None:
                 vram.update({key: clocks.get(key) for key in
                              ("gpu_clock_min_mhz", "gpu_clock_median_mhz", "gpu_clock_max_mhz")})
@@ -6051,7 +6059,8 @@ def run_benchmark(args: Any, ap: Any, resources: ExitStack, recording: CsvRecord
     print("GPM PCIe = median of repeat p95s; sat = valid GPU-interval time >=90% link rate; BUS = busy time (1 s)")
     print("PF/DC windows are reconstructed estimates; CSV includes coverage, validity and fallback diagnostics")
     print("GPU = GPM SM utilization / SM occupancy / tensor utilization / DRAM bandwidth utilization")
-    print("clock = GPU SM clock median/min in MHz during prefill/decode; a low value means the GPU did not run at full boost")
+    print("clock = GPU SM clock median/min in MHz during prefill/decode (first second skipped); "
+          "a low value means the GPU did not run at full boost")
     if drafting_on:
         print("draft % = accepted draft tokens (MTP, DFlash, draft model, ...); step ms = decode cost per verification step, "
               "independent of how predictable the generated text is")

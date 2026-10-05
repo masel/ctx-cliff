@@ -269,6 +269,13 @@ tokenizes the whole conversation in Python, on every request, cached or not. In 
 `prompt_ms` and `predicted_ms` in `.samples.csv`). It is not part of the prefill
 and decode rates, but an agent waits for it every turn.
 
+**VRAM is divided at start.** Strata fills the VRAM left at engine start with its
+expert cache and keeps that size. VRAM that other programs (browser, desktop
+apps) release later stays unused: in a run after closing them, `free` showed
+685 MiB throughout instead of about 280 MiB. Close GPU programs before starting
+Strata, not only before the benchmark, and compare runs only with similar VRAM at
+server start.
+
 **Strata specifics.** With thinking enabled and a small `--n-predict` Strata logs
 "the reply reached max tokens while still thinking, so it has no answer"; that is
 expected, thinking tokens are decoded like any other. Its adaptive expert cache
@@ -480,7 +487,7 @@ then combined per context point. Not all values are means.
 | `draft` | `100 × sum of accepted draft tokens / sum of proposed draft tokens` over all repeats; `n/a` without drafts at the point. Covers every kind of drafting llama-server reports in `timings.draft_n`/`draft_n_accepted` (MTP, DFlash, draft model, n-gram). The column appears when drafting was detected during the warmup or at the first point. CSV: `draft_n`, `draft_acc`, `draft_acc_pct`. |
 | `step ms` | Median cost of one verification step, `predicted_ms / (predicted_n − draft_n_accepted)`, over valid decode repeats; only with active drafting. Independent of how predictable the generated text is (see [Decode with drafting](#decode-with-drafting)). |
 | `free` | **Lowest free VRAM** during all requests of the point, prefill and decode together; MiB. |
-| `clock` | GPU SM clock median/min in MHz over the prefill and decode windows of the point (CSV: `gpu_clock_median_mhz`, `gpu_clock_min_mhz`); a low value means the GPU did not run at full boost. Time before the server starts processing is left out: Strata, for example, renders and tokenizes the whole conversation on the CPU first (about 2 s at 500k), and the idle GPU clocks down to a few hundred MHz meanwhile. The raw trace (`.vram.csv`) keeps all samples. |
+| `clock` | GPU SM clock median/min in MHz over the prefill and decode windows of the point, without their first second (CSV: `gpu_clock_median_mhz`, `gpu_clock_min_mhz`); a low value means the GPU did not run at full boost under load. Left out are the time before the server starts processing (Strata, for example, renders and tokenizes the whole conversation on the CPU first, about 2 s at 500k, while the idle GPU clocks down to a few hundred MHz) and the clock ramp after such idle time: in a 500k Strata run every sample below 2000 MHz lay within 1.2 s after prefill start. Requests shorter than one second keep their whole window. The raw trace (`.vram.csv`) keeps all samples. |
 | `power` | Mean of all valid power samples during the requests, weighted by the number of valid samples; W. |
 | `PF/DC PCIe` | GPM receive/transmit in MiB/s: first p95 per repeat and phase, then the median of these p95 values. |
 | `PF/DC sat` | Share of valid GPU interval time with **at least 90 %** of the theoretical PCIe link rate. |

@@ -231,6 +231,32 @@ class ClockWindowTests(unittest.TestCase):
         self.assertEqual(sample["gpu_clock_min_mhz"], 2850.0)
 
 
+    def test_clock_statistics_skip_the_first_second_of_prefill(self):
+        calls = []
+
+        class Monitor:
+            def set_label(self, *args):
+                pass
+
+            def register_pcie_phase_window(self, *args):
+                pass
+
+            def summarize(self, start, end):
+                calls.append((start, end))
+                return {**b.empty_vram(), "gpu_clock_median_mhz": 2880.0}
+
+        args = Mock(cache_mode="incremental", n_predict=8, deterministic=False, slot_id=0, ignore_eos=False,
+                    stream=False, min_decode_tokens=None, gpm_restart="off", sampler={}, seed=None,
+                    **{key: None for key in b.SAMPLER_OPTIONS})
+        runner = b.BenchmarkRunner(args, "http://x", Mock(), Mock(), Mock(), Monitor(), None, None)
+        response = {"content": "x", "timings": {"prompt_n": 10, "prompt_ms": 300.0, "predicted_n": 8,
+                                                "predicted_ms": 1500.0}}
+        with patch.object(b, "completion", side_effect=lambda *a, **k: time.sleep(2.0) or response):
+            runner._take_sample([1, 2, 3], 1000, 0)
+        start, end = calls[1]  # [0]: whole request, [1]: clocks, then the phases
+        self.assertAlmostEqual(end - start, 1.8 - b.CLOCK_RAMP_S, places=2)
+
+
 class ChatRunTests(unittest.TestCase):
     def run_main(self, *extra, reuse=True, same_reply=False, predicted=None):
         seen = []
